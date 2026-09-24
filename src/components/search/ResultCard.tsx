@@ -12,6 +12,9 @@
  *  - URL breadcrumb below title.
  *  - Snippet (3 lines max, with <mark> highlighting matched query terms in
  *    bg-primary/20).
+ *  - Source DNA strip (NEW): a 100×6px "genetic fingerprint" with 6 colored
+ *    segments encoding source-type / country / language / quality /
+ *    originality / freshness. See <SourceDna>.
  *  - Metadata row: source-type badge (colored), date (relative), language,
  *    originality badge ("Original" primary / "Duplicate" slate when !isOriginal).
  *  - If clusterSize > 1: a small "n more from this cluster" link that
@@ -25,11 +28,26 @@
  *  - Feedback row at the bottom-right: 👍 / 👎 / Report. Submits to
  *    /api/feedback, persists in localStorage per (query, docId) so the user
  *    can't vote twice on the same pair. See <ResultFeedback>.
+ *
+ * Premium 3D parallax tilt (NEW): as the cursor moves over the card, the
+ * card tilts toward the cursor (max ±3deg). Uses Framer Motion motion
+ * values + spring for smooth settle-back-to-zero on mouse leave.
+ * Disabled on touch devices (no hover) and under prefers-reduced-motion.
+ * The tilt compounds with the parent motion.div's `whileHover={{ y: -2 }}`
+ * lift in <SearchResults> — both effects fire simultaneously so the card
+ * lifts AND tilts.
  */
 
 'use client'
 
 import * as React from 'react'
+import {
+  motion,
+  useMotionValue,
+  useSpring,
+  useReducedMotion as useFramerReducedMotion,
+  useTransform,
+} from 'framer-motion'
 import {
   MoreHorizontal,
   ExternalLink,
@@ -71,6 +89,7 @@ import {
 } from './format'
 import { WhyThisResult } from './WhyThisResult'
 import { ResultFeedback } from './ResultFeedback'
+import { SourceDna } from './SourceDna'
 import type { SearchResult } from './types'
 
 export interface ResultCardProps {
@@ -88,6 +107,67 @@ export function ResultCard({ result, rank, onSummary }: ResultCardProps) {
   // Favicon state: try to load the real favicon; if it fails, fall back
   // to the source-type colored dot.
   const [faviconError, setFaviconError] = React.useState(false)
+
+  // --- 3D Parallax Tilt ---------------------------------------------------
+  // Subtle premium effect: as the cursor moves over the card, the card
+  // tilts toward the cursor (max ±6deg). Disabled on touch devices (no
+  // hover) and under prefers-reduced-motion. Uses Framer Motion motion
+  // values + spring for a smooth settle-back-to-zero on mouse leave.
+  const prefersReducedMotion = useFramerReducedMotion() ?? false
+  // We detect touch devices via pointer: coarse media query — these have
+  // no hover, so the tilt would fire on scroll-jank. Skip the effect.
+  const [isTouch, setIsTouch] = React.useState(false)
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return
+    const mq = window.matchMedia('(pointer: coarse)')
+    const update = () => setIsTouch(mq.matches)
+    update()
+    try {
+      mq.addEventListener?.('change', update)
+    } catch {
+      // Safari < 14 fallback
+      mq.addListener(update)
+    }
+    return () => {
+      try {
+        mq.removeEventListener?.('change', update)
+      } catch {
+        mq.removeListener(update)
+      }
+    }
+  }, [])
+  const tiltEnabled = !prefersReducedMotion && !isTouch
+
+  // Raw mouse position as motion values [0..1] within the card bounds.
+  const mvX = useMotionValue(0.5)
+  const mvY = useMotionValue(0.5)
+  // Spring-smoothed position so the tilt eases in/out rather than snapping.
+  const smoothX = useSpring(mvX, { stiffness: 220, damping: 22, mass: 0.4 })
+  const smoothY = useSpring(mvY, { stiffness: 220, damping: 22, mass: 0.4 })
+  // Tilt: (x - 0.5) * 6deg → ±3deg range (subtle, premium).
+  const rotateY = useTransform(smoothX, (v) => (v - 0.5) * 6)
+  const rotateX = useTransform(smoothY, (v) => (0.5 - v) * 6)
+
+  const cardRef = React.useRef<HTMLDivElement>(null)
+  const onPointerMove = React.useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!tiltEnabled) return
+      const el = cardRef.current
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      const x = (e.clientX - rect.left) / rect.width
+      const y = (e.clientY - rect.top) / rect.height
+      // Clamp to [0,1] — pointer can briefly leave the rect during fast moves.
+      mvX.set(Math.max(0, Math.min(1, x)))
+      mvY.set(Math.max(0, Math.min(1, y)))
+    },
+    [tiltEnabled, mvX, mvY],
+  )
+  const onPointerLeave = React.useCallback(() => {
+    if (!tiltEnabled) return
+    mvX.set(0.5)
+    mvY.set(0.5)
+  }, [tiltEnabled, mvX, mvY])
 
   const st = sourceTypeStyle(result.sourceType)
   const { host, path } = urlParts(result.url)
@@ -112,13 +192,22 @@ export function ResultCard({ result, rank, onSummary }: ResultCardProps) {
   }
 
   return (
-    <article
+    <motion.article
+      ref={cardRef}
+      onPointerMove={onPointerMove}
+      onPointerLeave={onPointerLeave}
+      style={{
+        perspective: tiltEnabled ? 1000 : undefined,
+        rotateX: tiltEnabled ? rotateX : 0,
+        rotateY: tiltEnabled ? rotateY : 0,
+        transformStyle: tiltEnabled ? 'preserve-3d' : undefined,
+        transitionTimingFunction: 'cubic-bezier(0.16, 1, 0.3, 1)',
+      }}
       className={cn(
         'group relative -mx-2 rounded-xl px-2 py-4 transition-all duration-300',
         'hover:bg-surface/60 hover:shadow-soft',
         'border-l-2 border-l-transparent hover:border-l-primary/40',
       )}
-      style={{ transitionTimingFunction: 'cubic-bezier(0.16, 1, 0.3, 1)' }}
       aria-label={`Result ${rank}: ${result.title}`}
       data-result-id={result.id}
     >
@@ -271,6 +360,15 @@ export function ResultCard({ result, rank, onSummary }: ResultCardProps) {
         )}
       </p>
 
+      {/* Source DNA strip — a per-result "genetic fingerprint": 6 colored
+          segments encoding source-type / country / language / quality /
+          originality / freshness. At a glance, the user can see the unique
+          algorithmic signature of each result. Re-colors smoothly when
+          results re-rank (e.g. when switching to Devil's Advocate lens). */}
+      <div className="mt-2">
+        <SourceDna result={result} />
+      </div>
+
       {/* Metadata row */}
       <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
         <Badge variant="outline" className={cn('text-[10px]', st.badge)}>
@@ -380,7 +478,7 @@ export function ResultCard({ result, rank, onSummary }: ResultCardProps) {
         docId={result.id}
         docUrl={result.url}
       />
-    </article>
+    </motion.article>
   )
 }
 

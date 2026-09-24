@@ -4,13 +4,17 @@
  * The main SERP (Search Engine Results Page). Renders:
  *
  *   - <SearchHeader> (sticky, white/blur backdrop)
- *   - <InterpretedQuery> (if interpretedQuery present)
+ *   - <QueryDna> (algorithmic introspection of the query — tokens, intent,
+ *     entities, languages, countries — replaces the legacy InterpretedQuery)
+ *   - <SearchLenses> (toggleable lens pills — Devil's Advocate inverts the
+ *     ranking to surface dissenting views)
  *   - Sponsored section: clearly labeled "Sponsored" header, then
  *     <SponsoredCard> list (max 3). Amber divider above + below.
  *   - "About N results (M seconds)" line.
  *   - "Did you mean …?" suggestion (if present) as a clickable link.
  *   - <AIAnswer> (if present)
  *   - Results list: <ResultCard> for each result, with <Separator> between.
+ *     Each card renders a <SourceDna> strip + 3D parallax tilt on hover.
  *   - Cluster expansion: if `clusters` has clusters with size > 1, render a
  *     "Related results (cluster)" section after the primary results.
  *   - <RelatedQuestions> (if relatedQuestions.length > 0)
@@ -56,7 +60,8 @@ import { cn } from '@/lib/utils'
 import { SearchHeader } from './SearchHeader'
 import { SearchPipeline } from './SearchPipeline'
 import { CommandPalette } from './CommandPalette'
-import { InterpretedQuery } from './InterpretedQuery'
+import { QueryDna } from './QueryDna'
+import { SearchLenses } from './SearchLenses'
 import { AIAnswer } from './AIAnswer'
 import { KnowledgeCard } from './KnowledgeCard'
 import { KnowledgeSidebar } from './KnowledgeSidebar'
@@ -75,6 +80,7 @@ export function SearchResults() {
   const results = useSearchStore((s) => s.results)
   const loading = useSearchStore((s) => s.loading)
   const mode = useSearchStore((s) => s.mode)
+  const lens = useSearchStore((s) => s.lens)
   const aiLayerLoading = useSearchStore((s) => s.aiLayerLoading)
   const error = useSearchStore((s) => s.error)
   const query = useSearchStore((s) => s.query)
@@ -192,14 +198,24 @@ export function SearchResults() {
         aria-busy={loading}
         className="mx-auto w-full max-w-6xl flex-1 px-4 py-4 sm:px-6 lg:px-8"
       >
-        {/* Interpreted query (small horizontal panel under the header) */}
-        {results?.interpretedQuery && (
-          <InterpretedQuery
-            interpreted={results.interpretedQuery}
-            personalizationFactors={results.personalizationFactors}
-            className="mb-4"
-          />
+        {/* Query DNA — algorithmic introspection of the user's query.
+            Replaces the legacy InterpretedQuery panel. Shows tokens
+            (POS-colored chips), intent, entities, languages, countries,
+            and a quick stats line. Spring entrance. Renders whenever the
+            user has typed a query (even before results arrive — the
+            component derives tokens from the raw query as a fallback
+            when the server-emitted parsed object is unavailable). */}
+        {(results?.interpretedQuery || query.trim()) && (
+          <QueryDna className="mb-4" />
         )}
+
+        {/* Search Lenses — creative perspective-shifting pills. Clicking a
+            lens updates the store + triggers a re-search with the new lens
+            in the request body; the result cards re-rank with a spring
+            animation (key change on the motion.section below re-triggers
+            the staggered entrance). Devil's Advocate INVERTS the ranking
+            to surface dissenting views. */}
+        <SearchLenses className="mb-4" />
 
         {/* Instant answer — real-time tool results (weather / time / math).
             Shown at the TOP of the SERP, above everything else. These answer
@@ -449,6 +465,11 @@ export function SearchResults() {
               </div>
             )}
             <motion.section
+              // Key on the lens so when the user clicks a different lens,
+              // the staggered entrance re-triggers and the cards
+              // spring-re-rank into their new order. This is what makes the
+              // SearchLenses UI feel "live".
+              key={`${lens}-${results.pagination.page}`}
               aria-label="Organic results"
               className="min-w-0 space-y-0"
               variants={RESULTS_CONTAINER_VARIANTS}

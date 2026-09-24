@@ -1,0 +1,851 @@
+     1→/**
+     2→ * search-store.ts
+     3→ * -----------------------------------------------------------------------------
+     4→ * Client-side state for CIRKLE. Uses Zustand.
+     5→ *
+     6→ * Responsibilities:
+     7→ *   - Hold the current query / mode / filters / results / loading state.
+     8→ *   - Execute searches by POSTing to /api/search (relative path — the gateway
+     9→ *     forwards it). No absolute URLs anywhere.
+    10→ *   - Hydrate from URL params (?q= ?mode= ?freshness= etc.) on mount.
+    11→ *   - Push state into URL via window.history.replaceState (NO router.push —
+    12→ *     that would cause a full re-render / re-fetch in some Next setups).
+    13→ *   - Persist mode + filters (except page) to localStorage when
+    14→ *     personalization is ON; in private mode, never persist.
+    15→ *   - Drive autocomplete (debounced 200ms GET /api/suggest?q=).
+    16→ *   - Open / close the Filters Sheet and the Deep Research Sheet.
+    17→ *   - Fetch a source profile for SourceProfileDialog.
+    18→ *   - Trigger the seed crawler when the index is empty.
+    19→ *   - Load /api/stats for the IndexStatusBar.
+    20→ *
+    21→ * This module is pure client-side — no Prisma, no LLM client.
+    22→ * -----------------------------------------------------------------------------
+    23→ */
+    24→
+    25→'use client'
+    26→
+    27→import { create } from 'zustand'
+    28→import type {
+    29→  AiMode,
+    30→  IndexStats,
+    31→  Personalization,
+    32→  SafeSearch,
+    33→  SearchFilters,
+    34→  SearchMode,
+    35→  SearchResponse,
+    36→  SeedCrawlResponse,
+    37→  SourceProfile,
+    38→  StatsResponse,
+    39→  SuggestResponse,
+    40→  ResearchReport,
+    41→  Freshness,
+    42→  AILayer,
+    43→} from '@/components/search/types'
+    44→
+    45→// --- Saved search (localStorage-only) --------------------------------------
+    46→
+    47→export interface SavedSearch {
+    48→  id: string
+    49→  query: string
+    50→  mode: SearchMode
+    51→  filters: SearchFilters
+    52→  savedAt: string
+    53→  resultCount?: number
+    54→}
+    55→
+    56→// --- Defaults -------------------------------------------------------------
+    57→
+    58→export const DEFAULT_FILTERS: SearchFilters = {
+    59→  freshness: 'ANY',
+    60→  sourceTypes: [],
+    61→  domainDiversity: 2,
+    62→  aiMode: 'AUTO',
+    63→  personalization: 'OFF',
+    64→  safeSearch: 'ON',
+    65→  page: 1,
+    66→  pageSize: 10,
+    67→}
+    68→
+    69→export const DEFAULT_MODE: SearchMode = 'BALANCED'
+    70→
+    71→// --- Store shape ----------------------------------------------------------
+    72→
+    73→interface SearchState {
+    74→  // Core state
+    75→  query: string
+    76→  mode: SearchMode
+    77→  filters: SearchFilters
+    78→  results: SearchResponse | null
+    79→  loading: boolean
+    80→  error: string | null
+    81→
+    82→  // UI panels
+    83→  showFilters: boolean
+    84→  showResearch: boolean
+    85→  showSourceProfile: string | null // docId when open
+    86→  showSavedSearches: boolean
+    87→  showCommandPalette: boolean
+    88→
+    89→  // Autocomplete
+    90→  autocompleteOpen: boolean
+    91→  autocompleteItems: string[]
+    92→  autocompleteLoading: boolean
+    93→
+    94→  // Research
+    95→  research: ResearchReport | null
+    96→  researchLoading: boolean
+    97→  researchError: string | null
+    98→
+    99→  // Lazy AI layer (fetched after results render so the SERP appears fast)
+   100→  aiLayerLoading: boolean
+   101→
+   102→  // Stats / source profile cache
+   103→  stats: StatsResponse | null
+   104→  sourceProfile: SourceProfile | null
+   105→  sourceProfileLoading: boolean
+   106→  sourceProfileError: string | null
+   107→
+   108→  // Saved searches (localStorage-only — privacy-respecting, no server sync
+   109→  // unless the user explicitly enables personalization in the future).
+   110→  savedSearches: SavedSearch[]
+   111→
+   112→  // Recent searches (localStorage-only, only recorded when personalization
+   113→  // is ON — in private mode, nothing is recorded). Shown in the autocomplete
+   114→  // when the search box is empty + focused.
+   115→  recentSearches: string[]
+   116→
+   117→  // Internal: store a debounce timer handle for autocomplete.
+   118→  _autocompleteTimer: ReturnType<typeof setTimeout> | null
+   119→  _hydrated: boolean
+   120→
+   121→  // Actions
+   122→  setQuery: (q: string) => void
+   123→  setMode: (m: SearchMode) => void
+   124→  setFilters: (patch: Partial<SearchFilters>) => void
+   125→  resetFilters: () => void
+   126→  toggleFilter: () => void
+   127→  toggleResearch: () => void
+   128→  openSourceProfile: (docId: string | null) => void
+   129→  toggleSavedSearches: () => void
+   130→  setShowCommandPalette: (open: boolean) => void
+   131→  toggleCommandPalette: () => void
+   132→
+   133→  executeSearch: () => Promise<void>
+   134→  loadAutocomplete: (prefix: string) => void
+   135→  selectAutocomplete: (suggestion: string) => Promise<void>
+   136→  setAutocompleteOpen: (open: boolean) => void
+   137→
+   138→  runResearch: () => Promise<void>
+   139→  loadAILayer: () => Promise<void>
+   140→  loadSourceProfile: (id: string) => Promise<SourceProfile | null>
+   141→  triggerSeedCrawl: (urls?: string[]) => Promise<SeedCrawlResponse | null>
+   142→  loadStats: () => Promise<void>
+   143→
+   144→  // Saved searches
+   145→  saveCurrentSearch: () => void
+   146→  deleteSavedSearch: (id: string) => void
+   147→  applySavedSearch: (id: string) => void
+   148→  loadSavedSearches: () => void
+   149→
+   150→  // Recent searches
+   151→  loadRecentSearches: () => void
+   152→  recordRecentSearch: (q: string) => void
+   153→  clearRecentSearches: () => void
+   154→
+   155→  hydrateFromUrl: () => Promise<void>
+   156→  _writeUrl: () => void
+   157→  _persistPrefs: () => void
+   158→  _loadPrefs: () => void
+   159→}
+   160→
+   161→// --- Helpers ---------------------------------------------------------------
+   162→
+   163→const LS_KEY = 'cirkle-prefs'
+   164→const LS_SAVED_KEY = 'cirkle-saved-searches'
+   165→const LS_RECENT_KEY = 'cirkle-recent-searches'
+   166→
+   167→function isBrowser(): boolean {
+   168→  return typeof window !== 'undefined' && typeof window.document !== 'undefined'
+   169→}
+   170→
+   171→/**
+   172→ * Push current query/mode/filters state into the URL via history.replaceState.
+   173→ * We DO NOT use the Next router — that would trigger a full re-render and
+   174→ * potentially re-fetch in some configurations.
+   175→ *
+   176→ * URL params emitted:
+   177→ *   ?q=        query
+   178→ *   ?mode=     SearchMode
+   179→ *   ?freshness= Freshness
+   180→ *   ?src=      comma-separated source types (only if non-empty)
+   181→ *   ?diversity= domainDiversity (0|1|2|3)
+   182→ *   ?ai=       aiMode
+   183→ *   ?pers=     personalization
+   184→ *   ?safe=     safeSearch
+   185→ *   ?lang=     language (if set)
+   186→ *   ?country=  country (if set)
+   187→ *   ?page=     page (only if > 1)
+   188→ */
+   189→function writeUrl(state: { query: string; mode: SearchMode; filters: SearchFilters }) {
+   190→  if (!isBrowser()) return
+   191→  const params = new URLSearchParams()
+   192→  if (state.query.trim()) params.set('q', state.query.trim())
+   193→  params.set('mode', state.mode)
+   194→  params.set('freshness', state.filters.freshness)
+   195→  if (state.filters.sourceTypes.length > 0) {
+   196→    params.set('src', state.filters.sourceTypes.join(','))
+   197→  }
+   198→  params.set('diversity', String(state.filters.domainDiversity))
+   199→  params.set('ai', state.filters.aiMode)
+   200→  params.set('pers', state.filters.personalization)
+   201→  params.set('safe', state.filters.safeSearch)
+   202→  if (state.filters.language) params.set('lang', state.filters.language)
+   203→  if (state.filters.country) params.set('country', state.filters.country)
+   204→  if (state.filters.page > 1) params.set('page', String(state.filters.page))
+   205→  if (state.filters.freshness === 'CUSTOM') {
+   206→    if (state.filters.freshnessCustomStart) {
+   207→      params.set('from', state.filters.freshnessCustomStart)
+   208→    }
+   209→    if (state.filters.freshnessCustomEnd) {
+   210→      params.set('to', state.filters.freshnessCustomEnd)
+   211→    }
+   212→  }
+   213→  const search = params.toString()
+   214→  const newUrl = search ? `/?${search}` : '/'
+   215→  try {
+   216→    window.history.replaceState(null, '', newUrl)
+   217→  } catch {
+   218→    // ignore — some sandboxed iframes block this
+   219→  }
+   220→}
+   221→
+   222→function parseFiltersFromUrl(): {
+   223→  query: string
+   224→  mode: SearchMode
+   225→  filters: Partial<SearchFilters>
+   226→} {
+   227→  if (!isBrowser()) return { query: '', mode: DEFAULT_MODE, filters: {} }
+   228→  const params = new URLSearchParams(window.location.search)
+   229→  const query = params.get('q') ?? ''
+   230→  const modeParam = params.get('mode') as SearchMode | null
+   231→  const validModes: SearchMode[] = [
+   232→    'BALANCED',
+   233→    'EXACT',
+   234→    'LATEST',
+   235→    'RESEARCH',
+   236→    'OFFICIAL',
+   237→    'ACADEMIC',
+   238→    'COMMUNITY',
+   239→    'NEWS',
+   240→    'IMAGES',
+   241→  ]
+   242→  const mode: SearchMode =
+   243→    modeParam && validModes.includes(modeParam) ? modeParam : DEFAULT_MODE
+   244→  const filters: Partial<SearchFilters> = {}
+   245→
+   246→  const freshness = params.get('freshness') as Freshness | null
+   247→  const validFresh: Freshness[] = ['ANY', 'HOUR', 'DAY', 'WEEK', 'MONTH', 'YEAR', 'CUSTOM']
+   248→  if (freshness && validFresh.includes(freshness)) filters.freshness = freshness
+   249→
+   250→  const src = params.get('src')
+   251→  if (src) {
+   252→    const arr = src
+   253→      .split(',')
+   254→      .map((s) => s.trim().toUpperCase())
+   255→      .filter((s) =>
+   256→        ['OFFICIAL', 'GOVERNMENT', 'ACADEMIC', 'NEWS', 'COMMUNITY', 'COMMERCIAL', 'PRIMARY', 'WEB'].includes(s),
+   257→      )
+   258→    if (arr.length > 0) filters.sourceTypes = arr as SearchFilters['sourceTypes']
+   259→  }
+   260→
+   261→  const div = params.get('diversity')
+   262→  if (div === '0' || div === '1' || div === '2' || div === '3') {
+   263→    filters.domainDiversity = parseInt(div, 10) as 0 | 1 | 2 | 3
+   264→  }
+   265→
+   266→  const ai = params.get('ai') as AiMode | null
+   267→  if (ai && ['AUTO', 'ON', 'OFF'].includes(ai)) filters.aiMode = ai
+   268→
+   269→  const pers = params.get('pers') as Personalization | null
+   270→  if (pers && ['ON', 'OFF'].includes(pers)) filters.personalization = pers
+   271→
+   272→  const safe = params.get('safe') as SafeSearch | null
+   273→  if (safe && ['ON', 'OFF'].includes(safe)) filters.safeSearch = safe
+   274→
+   275→  const lang = params.get('lang')
+   276→  if (lang) filters.language = lang
+   277→
+   278→  const country = params.get('country')
+   279→  if (country) filters.country = country
+   280→
+   281→  const page = parseInt(params.get('page') ?? '1', 10)
+   282→  if (!Number.isNaN(page) && page > 0) filters.page = page
+   283→
+   284→  const from = params.get('from')
+   285→  const to = params.get('to')
+   286→  if (from) filters.freshnessCustomStart = from
+   287→  if (to) filters.freshnessCustomEnd = to
+   288→
+   289→  return { query, mode, filters }
+   290→}
+   291→
+   292→// --- Store ----------------------------------------------------------------
+   293→
+   294→export const useSearchStore = create<SearchState>((set, get) => ({
+   295→  query: '',
+   296→  mode: DEFAULT_MODE,
+   297→  filters: { ...DEFAULT_FILTERS },
+   298→  results: null,
+   299→  loading: false,
+   300→  error: null,
+   301→
+   302→  showFilters: false,
+   303→  showResearch: false,
+   304→  showSourceProfile: null,
+   305→  showSavedSearches: false,
+   306→  showCommandPalette: false,
+   307→
+   308→  autocompleteOpen: false,
+   309→  autocompleteItems: [],
+   310→  autocompleteLoading: false,
+   311→
+   312→  research: null,
+   313→  researchLoading: false,
+   314→  researchError: null,
+   315→
+   316→  aiLayerLoading: false,
+   317→
+   318→  stats: null,
+   319→  sourceProfile: null,
+   320→  sourceProfileLoading: false,
+   321→  sourceProfileError: null,
+   322→
+   323→  savedSearches: [],
+   324→
+   325→  recentSearches: [],
+   326→
+   327→  _autocompleteTimer: null,
+   328→  _hydrated: false,
+   329→
+   330→  setQuery: (q) => {
+   331→    set({ query: q })
+   332→  },
+   333→
+   334→  setMode: (m) => {
+   335→    set({ mode: m, filters: { ...get().filters, page: 1 } })
+   336→    get()._persistPrefs()
+   337→    // If we're already in an active results view, re-run with the new mode.
+   338→    if (get().results || get().query.trim()) {
+   339→      void get().executeSearch()
+   340→    } else {
+   341→      get()._writeUrl()
+   342→    }
+   343→  },
+   344→
+   345→  setFilters: (patch) => {
+   346→    const next = { ...get().filters, ...patch }
+   347→    if (
+   348→      patch.freshness !== undefined &&
+   349→      patch.freshness !== 'CUSTOM'
+   350→    ) {
+   351→      // reset custom range if leaving CUSTOM
+   352→      next.freshnessCustomStart = undefined
+   353→      next.freshnessCustomEnd = undefined
+   354→    }
+   355→    if (
+   356→      patch.sourceTypes !== undefined ||
+   357→      patch.freshness !== undefined ||
+   358→      patch.domainDiversity !== undefined ||
+   359→      patch.aiMode !== undefined ||
+   360→      patch.language !== undefined ||
+   361→      patch.country !== undefined
+   362→    ) {
+   363→      // Any structural filter change resets the page.
+   364→      next.page = 1
+   365→    }
+   366→    set({ filters: next })
+   367→    get()._persistPrefs()
+   368→  },
+   369→
+   370→  resetFilters: () => {
+   371→    const reset = { ...DEFAULT_FILTERS }
+   372→    // Preserve personalization (private mode is sticky — privacy default).
+   373→    reset.personalization = get().filters.personalization
+   374→    set({ filters: reset })
+   375→    get()._persistPrefs()
+   376→    void get().executeSearch()
+   377→  },
+   378→
+   379→  toggleFilter: () => set({ showFilters: !get().showFilters }),
+   380→  toggleSavedSearches: () => set({ showSavedSearches: !get().showSavedSearches }),
+   381→  setShowCommandPalette: (open) => set({ showCommandPalette: open }),
+   382→  toggleCommandPalette: () => set({ showCommandPalette: !get().showCommandPalette }),
+   383→  toggleResearch: () => {
+   384→    const willOpen = !get().showResearch
+   385→    set({ showResearch: willOpen })
+   386→    if (willOpen && !get().research && get().query.trim()) {
+   387→      void get().runResearch()
+   388→    }
+   389→  },
+   390→  openSourceProfile: (docId) => {
+   391→    set({ showSourceProfile: docId, sourceProfile: null, sourceProfileError: null })
+   392→    if (docId) void get().loadSourceProfile(docId)
+   393→  },
+   394→
+   395→  executeSearch: async () => {
+   396→    const state = get()
+   397→    const q = state.query.trim()
+   398→    if (!q) {
+   399→      set({ results: null, error: null })
+   400→      get()._writeUrl()
+   401→      return
+   402→    }
+   403→    set({ loading: true, error: null })
+   404→    try {
+   405→      const body = {
+   406→        query: q,
+   407→        mode: state.mode,
+   408→        filters: state.filters,
+   409→      }
+   410→      const resp = await fetch('/api/search', {
+   411→        method: 'POST',
+   412→        headers: { 'Content-Type': 'application/json' },
+   413→        body: JSON.stringify(body),
+   414→      })
+   415→      if (!resp.ok) {
+   416→        const text = await resp.text().catch(() => '')
+   417→        throw new Error(
+   418→          `Search failed (HTTP ${resp.status})${text ? `: ${text.slice(0, 200)}` : ''}`,
+   419→        )
+   420→      }
+   421→      const data = (await resp.json()) as SearchResponse
+   422→      set({ results: data, loading: false, aiLayerLoading: true })
+   423→      get()._writeUrl()
+   424→      // Record this search in recent-searches (only if personalization is ON —
+   425→      // the recordRecentSearch action itself checks + no-ops in private mode).
+   426→      get().recordRecentSearch(q)
+   427→      // Refresh stats too — index may have changed behind us.
+   428→      void get().loadStats()
+   429→      // --- Lazy AI layer: fetch the AI answer + knowledge card + related
+   430→      // questions SEPARATELY so the user sees results in ~1s, then AI streams
+   431→      // in after. This fixes the "13 seconds before anything shows" problem.
+   432→      void get().loadAILayer()
+   433→    } catch (e: any) {
+   434→      set({
+   435→        loading: false,
+   436→        error: e?.message ?? 'Search failed for an unknown reason.',
+   437→      })
+   438→    }
+   439→  },
+   440→
+   441→  loadAutocomplete: (prefix) => {
+   442→    const trimmed = prefix.trim()
+   443→    const existing = get()._autocompleteTimer
+   444→    if (existing) clearTimeout(existing)
+   445→
+   446→    if (!trimmed) {
+   447→      set({
+   448→        autocompleteItems: [],
+   449→        autocompleteLoading: false,
+   450→        autocompleteOpen: false,
+   451→      })
+   452→      return
+   453→    }
+   454→
+   455→    set({ autocompleteLoading: true, autocompleteOpen: true })
+   456→
+   457→    const timer = setTimeout(async () => {
+   458→      try {
+   459→        const resp = await fetch(
+   460→          `/api/suggest?q=${encodeURIComponent(trimmed)}`,
+   461→          { headers: { Accept: 'application/json' } },
+   462→        )
+   463→        if (!resp.ok) {
+   464→          set({ autocompleteItems: [], autocompleteLoading: false })
+   465→          return
+   466→        }
+   467→        const data = (await resp.json()) as SuggestResponse
+   468→        set({
+   469→          autocompleteItems: data.suggestions ?? [],
+   470→          autocompleteLoading: false,
+   471→        })
+   472→      } catch {
+   473→        set({ autocompleteItems: [], autocompleteLoading: false })
+   474→      }
+   475→    }, 200)
+   476→    set({ _autocompleteTimer: timer })
+   477→  },
+   478→
+   479→  selectAutocomplete: async (suggestion) => {
+   480→    set({
+   481→      query: suggestion,
+   482→      autocompleteOpen: false,
+   483→      autocompleteItems: [],
+   484→      autocompleteLoading: false,
+   485→      filters: { ...get().filters, page: 1 },
+   486→    })
+   487→    await get().executeSearch()
+   488→  },
+   489→
+   490→  setAutocompleteOpen: (open) => set({ autocompleteOpen: open }),
+   491→
+   492→  runResearch: async () => {
+   493→    const q = get().query.trim()
+   494→    if (!q) return
+   495→    set({ researchLoading: true, researchError: null, research: null })
+   496→    try {
+   497→      const resp = await fetch('/api/research', {
+   498→        method: 'POST',
+   499→        headers: { 'Content-Type': 'application/json' },
+   500→        body: JSON.stringify({ question: q, depth: 'standard' }),
+   501→      })
+   502→      if (!resp.ok) {
+   503→        throw new Error(`Research failed (HTTP ${resp.status})`)
+   504→      }
+   505→      const data = (await resp.json()) as ResearchReport
+   506→      set({ research: data, researchLoading: false })
+   507→    } catch (e: any) {
+   508→      set({
+   509→        researchLoading: false,
+   510→        researchError: e?.message ?? 'Deep research failed.',
+   511→      })
+   512→    }
+   513→  },
+   514→
+   515→  loadSourceProfile: async (id) => {
+   516→    set({ sourceProfileLoading: true, sourceProfileError: null })
+   517→    try {
+   518→      const resp = await fetch(
+   519→        `/api/source/${encodeURIComponent(id)}`,
+   520→        { headers: { Accept: 'application/json' } },
+   521→      )
+   522→      if (!resp.ok) {
+   523→        throw new Error(`Source profile failed (HTTP ${resp.status})`)
+   524→      }
+   525→      const data = (await resp.json()) as SourceProfile
+   526→      set({ sourceProfile: data, sourceProfileLoading: false })
+   527→      return data
+   528→    } catch (e: any) {
+   529→      set({
+   530→        sourceProfileLoading: false,
+   531→        sourceProfileError: e?.message ?? 'Failed to load source profile.',
+   532→      })
+   533→      return null
+   534→    }
+   535→  },
+   536→
+   537→  triggerSeedCrawl: async (urls) => {
+   538→    try {
+   539→      const resp = await fetch('/api/seed', {
+   540→        method: 'POST',
+   541→        headers: { 'Content-Type': 'application/json' },
+   542→        body: JSON.stringify(urls && urls.length > 0 ? { urls } : {}),
+   543→      })
+   544→      if (!resp.ok) {
+   545→        throw new Error(`Seed crawl failed (HTTP ${resp.status})`)
+   546→      }
+   547→      const data = (await resp.json()) as SeedCrawlResponse
+   548→      // Refresh stats after crawl.
+   549→      void get().loadStats()
+   550→      return data
+   551→    } catch (e: any) {
+   552→      // surface error to caller; the UI shows a toast.
+   553→      throw e
+   554→    }
+   555→  },
+   556→
+   557→  loadStats: async () => {
+   558→    try {
+   559→      const resp = await fetch('/api/stats', { headers: { Accept: 'application/json' } })
+   560→      if (!resp.ok) return
+   561→      const data = (await resp.json()) as StatsResponse
+   562→      set({ stats: data })
+   563→    } catch {
+   564→      // silent — stats are nice-to-have
+   565→    }
+   566→  },
+   567→
+   568→  // --- Lazy AI layer -------------------------------------------------------
+   569→  // Called by executeSearch() AFTER results render. Fetches the AI answer +
+   570→  // knowledge card + related questions in parallel via /api/search/ai, then
+   571→  // merges them into the existing `results` object WITHOUT re-fetching the
+   572→  // organic results. This is what makes the SERP feel fast — results appear
+   573→  // in ~1s, AI streams in after.
+   574→  loadAILayer: async () => {
+   575→    const state = get()
+   576→    if (!state.results) return
+   577→    const { query, mode, filters, results: currentResults } = state
+   578→    if (!query.trim()) return
+   579→    // Skip when AI is OFF — no point fetching.
+   580→    if (filters.aiMode === 'OFF') {
+   581→      set({ aiLayerLoading: false })
+   582→      return
+   583→    }
+   584→    set({ aiLayerLoading: true })
+   585→    try {
+   586→      const resp = await fetch('/api/search/ai', {
+   587→        method: 'POST',
+   588→        headers: { 'Content-Type': 'application/json' },
+   589→        body: JSON.stringify({
+   590→          query,
+   591→          mode,
+   592→          filters,
+   593→          results: currentResults.results.slice(0, 8),
+   594→        }),
+   595→      })
+   596→      if (!resp.ok) return
+   597→      const layer = (await resp.json()) as AILayer
+   598→      // Merge the AI layer INTO the existing results object (preserve the
+   599→      // fast-loaded organic results + instant answer + sponsored + etc).
+   600→      const fresh = get().results
+   601→      if (!fresh) return
+   602→      set({
+   603→        results: {
+   604→          ...fresh,
+   605→          aiAnswer: layer.aiAnswer,
+   606→          knowledgeCard: layer.knowledgeCard,
+   607→          relatedQuestions: layer.relatedQuestions,
+   608→        },
+   609→        aiLayerLoading: false,
+   610→      })
+   611→    } catch {
+   612→      set({ aiLayerLoading: false })
+   613→    }
+   614→  },
+   615→
+   616→  // --- Saved searches (localStorage-only) ---------------------------------
+   617→  // Privacy-preserving: never sent to the server. The SavedSearch Prisma
+   618→  // model exists for future opt-in sync, but for now everything is local.
+   619→
+   620→  loadSavedSearches: () => {
+   621→    if (!isBrowser()) return
+   622→    try {
+   623→      const raw = localStorage.getItem(LS_SAVED_KEY)
+   624→      if (!raw) {
+   625→        set({ savedSearches: [] })
+   626→        return
+   627→      }
+   628→      const parsed = JSON.parse(raw) as SavedSearch[]
+   629→      if (Array.isArray(parsed)) {
+   630→        set({ savedSearches: parsed })
+   631→      }
+   632→    } catch {
+   633→      set({ savedSearches: [] })
+   634→    }
+   635→  },
+   636→
+   637→  saveCurrentSearch: () => {
+   638→    const { query, mode, filters, results, savedSearches } = get()
+   639→    const q = query.trim()
+   640→    if (!q) return
+   641→    // Don't save duplicates (same query + mode + freshness + sourceTypes).
+   642→    const sig = `${q}|${mode}|${filters.freshness}|${filters.sourceTypes.join(',')}`
+   643→    const dupe = savedSearches.find((s) => {
+   644→      const s2 = `${s.query}|${s.mode}|${s.filters.freshness}|${s.filters.sourceTypes.join(',')}`
+   645→      return s2 === sig
+   646→    })
+   647→    if (dupe) return
+   648→    const entry: SavedSearch = {
+   649→      id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+   650→      query: q,
+   651→      mode,
+   652→      filters: { ...filters, page: 1 },
+   653→      savedAt: new Date().toISOString(),
+   654→      resultCount: results?.pagination.totalResults,
+   655→    }
+   656→    const next = [entry, ...savedSearches].slice(0, 50) // cap at 50
+   657→    set({ savedSearches: next })
+   658→    if (isBrowser()) {
+   659→      try {
+   660→        localStorage.setItem(LS_SAVED_KEY, JSON.stringify(next))
+   661→      } catch {
+   662→        // storage full / unavailable — keep in-memory only
+   663→      }
+   664→    }
+   665→  },
+   666→
+   667→  deleteSavedSearch: (id) => {
+   668→    const next = get().savedSearches.filter((s) => s.id !== id)
+   669→    set({ savedSearches: next })
+   670→    if (isBrowser()) {
+   671→      try {
+   672→        localStorage.setItem(LS_SAVED_KEY, JSON.stringify(next))
+   673→      } catch {
+   674→        // ignore
+   675→      }
+   676→    }
+   677→  },
+   678→
+   679→  applySavedSearch: (id) => {
+   680→    const entry = get().savedSearches.find((s) => s.id === id)
+   681→    if (!entry) return
+   682→    set({
+   683→      query: entry.query,
+   684→      mode: entry.mode,
+   685→      filters: { ...entry.filters, page: 1 },
+   686→      showSavedSearches: false,
+   687→    })
+   688→    void get().executeSearch()
+   689→  },
+   690→
+   691→  // --- Recent searches (localStorage, only when personalization is ON) ---
+   692→  loadRecentSearches: () => {
+   693→    if (!isBrowser()) return
+   694→    try {
+   695→      const raw = localStorage.getItem(LS_RECENT_KEY)
+   696→      if (!raw) {
+   697→        set({ recentSearches: [] })
+   698→        return
+   699→      }
+   700→      const parsed = JSON.parse(raw) as string[]
+   701→      if (Array.isArray(parsed)) set({ recentSearches: parsed })
+   702→    } catch {
+   703→      set({ recentSearches: [] })
+   704→    }
+   705→  },
+   706→
+   707→  recordRecentSearch: (q) => {
+   708→    const query = q.trim()
+   709→    if (!query) return
+   710→    // Privacy: only record when personalization is ON. In private mode,
+   711→    // recent searches are never persisted.
+   712→    if (get().filters.personalization !== 'ON') return
+   713→    const next = [query, ...get().recentSearches.filter((s) => s !== query)].slice(0, 10)
+   714→    set({ recentSearches: next })
+   715→    if (isBrowser()) {
+   716→      try {
+   717→        localStorage.setItem(LS_RECENT_KEY, JSON.stringify(next))
+   718→      } catch {
+   719→        // ignore storage errors
+   720→      }
+   721→    }
+   722→  },
+   723→
+   724→  clearRecentSearches: () => {
+   725→    set({ recentSearches: [] })
+   726→    if (isBrowser()) {
+   727→      try {
+   728→        localStorage.removeItem(LS_RECENT_KEY)
+   729→      } catch {
+   730→        // ignore
+   731→      }
+   732→    }
+   733→  },
+   734→
+   735→  hydrateFromUrl: async () => {
+   736→    if (get()._hydrated) return
+   737→    const { query, mode, filters } = parseFiltersFromUrl()
+   738→    const merged: SearchFilters = { ...DEFAULT_FILTERS, ...filters }
+   739→    // Always load the personalization preference from localStorage when the
+   740→    // URL doesn't explicitly set it — this makes the personalization toggle
+   741→    // sticky across page loads (so recent searches work on the home page
+   742→    // after the user previously enabled personalization). When the URL DOES
+   743→    // set pers=, that wins (URL is the source of truth).
+   744→    if (!filters.personalization && isBrowser()) {
+   745→      try {
+   746→        const saved = JSON.parse(localStorage.getItem(LS_KEY) ?? '{}')
+   747→        if (saved.filters?.personalization) {
+   748→          merged.personalization = saved.filters.personalization
+   749→        }
+   750→      } catch {
+   751→        // ignore
+   752→      }
+   753→    }
+   754→    // If personalization is ON, also load any saved prefs (mode + structural
+   755→    // filters) — but URL wins when both are present.
+   756→    if (merged.personalization === 'ON' && isBrowser()) {
+   757→      try {
+   758→        const saved = JSON.parse(localStorage.getItem(LS_KEY) ?? '{}')
+   759→        if (saved.mode && !query) {
+   760→          // No query in URL — start from saved prefs.
+   761→          ;(set as any)({ mode: saved.mode })
+   762→        }
+   763→        if (saved.filters && !filters.freshness) {
+   764→          Object.assign(merged, saved.filters)
+   765→        }
+   766→      } catch {
+   767→        // ignore
+   768→      }
+   769→    }
+   770→    set({
+   771→      query,
+   772→      mode: query ? mode : mode, // always honor URL mode if present
+   773→      filters: merged,
+   774→      _hydrated: true,
+   775→    })
+   776→    // Persist the resolved personalization preference to localStorage so the
+   777→    // NEXT page load (which may not have pers= in the URL) can restore it.
+   778→    // This makes the personalization toggle sticky across navigations.
+   779→    get()._persistPrefs()
+   780→    // Always refresh stats + load any saved/recent searches on hydration.
+   781→    void get().loadStats()
+   782→    get().loadSavedSearches()
+   783→    get().loadRecentSearches()
+   784→    if (query.trim()) {
+   785→      await get().executeSearch()
+   786→    }
+   787→  },
+   788→
+   789→  _writeUrl: () => {
+   790→    writeUrl({ query: get().query, mode: get().mode, filters: get().filters })
+   791→  },
+   792→
+   793→  _persistPrefs: () => {
+   794→    // Only persist when personalization is ON — in private mode, NEVER persist.
+   795→    if (!isBrowser()) return
+   796→    const { filters, mode } = get()
+   797→    if (filters.personalization !== 'ON') {
+   798→      try {
+   799→        localStorage.removeItem(LS_KEY)
+   800→      } catch {
+   801→        // ignore
+   802→      }
+   803→      return
+   804→    }
+   805→    try {
+   806→      const payload = {
+   807→        mode,
+   808→        filters: {
+   809→          freshness: filters.freshness,
+   810→          sourceTypes: filters.sourceTypes,
+   811→          domainDiversity: filters.domainDiversity,
+   812→          aiMode: filters.aiMode,
+   813→          personalization: filters.personalization,
+   814→          safeSearch: filters.safeSearch,
+   815→          language: filters.language,
+   816→          country: filters.country,
+   817→          // page intentionally NOT persisted.
+   818→        },
+   819→      }
+   820→      localStorage.setItem(LS_KEY, JSON.stringify(payload))
+   821→    } catch {
+   822→      // ignore
+   823→    }
+   824→  },
+   825→
+   826→  _loadPrefs: () => {
+   827→    if (!isBrowser()) return
+   828→    try {
+   829→      const saved = JSON.parse(localStorage.getItem(LS_KEY) ?? '{}')
+   830→      if (saved.mode) set({ mode: saved.mode })
+   831→      if (saved.filters) {
+   832→        const f = saved.filters
+   833→        set({
+   834→          filters: {
+   835→            ...get().filters,
+   836→            ...f,
+   837→            page: 1, // never restore page
+   838→          },
+   839→        })
+   840→      }
+   841→    } catch {
+   842→      // ignore
+   843→    }
+   844→  },
+   845→}))
+   846→
+   847→// Re-export IndexStats type for the IndexStatusBar component (which uses the
+   848→// `indexStats` field from SearchResponse AND the `stats` field from this
+   849→// store — both are the same shape).
+   850→export type { IndexStats }
+   851→

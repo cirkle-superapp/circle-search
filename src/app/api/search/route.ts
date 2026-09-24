@@ -10,7 +10,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { search } from '@/lib/search'
 import { checkRateLimit, getClientIP } from '@/lib/search/rate-limit'
-import type { SearchMode, SearchFilters } from '@/lib/search/ranking'
+import type { SearchMode, SearchFilters, SearchLens } from '@/lib/search/ranking'
 
 export const runtime = 'nodejs' // Prisma + LLM client (../llm) require Node.
 export const dynamic = 'force-dynamic'
@@ -18,6 +18,10 @@ export const dynamic = 'force-dynamic'
 const ALLOWED_MODES: SearchMode[] = [
   'BALANCED', 'EXACT', 'LATEST', 'RESEARCH',
   'OFFICIAL', 'ACADEMIC', 'COMMUNITY', 'NEWS', 'IMAGES',
+]
+
+const ALLOWED_LENSES: SearchLens[] = [
+  'BALANCED', 'ACADEMIC', 'NEWS', 'PRIMARY', 'COMMUNITY', 'COMMERCIAL', 'DEVILS_ADVOCATE',
 ]
 
 const ALLOWED_SOURCE_TYPES = new Set([
@@ -107,6 +111,11 @@ export async function POST(req: NextRequest) {
     ? body.mode
     : 'BALANCED'
 
+  // Creative lens — algorithmic perspective shift (default BALANCED).
+  const lens: SearchLens = ALLOWED_LENSES.includes(body?.lens)
+    ? body.lens
+    : 'BALANCED'
+
   const filters = coerceFilters(body?.filters)
 
   // Anonymous session token (only used to scope SearchHistory rows when
@@ -120,7 +129,7 @@ export async function POST(req: NextRequest) {
   const personalization = filters.personalization
 
   try {
-    const resp = await search(query, mode, filters, { sessionId, personalization })
+    const resp = await search(query, mode, filters, { sessionId, personalization, lens })
     return NextResponse.json(resp, {
       headers: {
         // Search results depend on the live index — never cache.

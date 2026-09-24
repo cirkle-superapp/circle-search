@@ -311,6 +311,28 @@
   .hero-spotlight.spotlight-active {
     opacity: 1;
   }
+
+  /* --- Trending ticker (home page) --------------------------------------
+     A horizontal auto-scrolling strip of trending queries, marquee-style.
+     The track is duplicated (two copies side-by-side) so the scroll loops
+     seamlessly. The parent .trending-ticker element toggles
+     .ticker-paused on hover (via the .group-hover utility) to stop the
+     animation when the user is interacting with a chip. */
+  .trending-ticker-track {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    animation: cirkleTicker 32s linear infinite;
+    will-change: transform;
+  }
+  .trending-ticker:hover .trending-ticker-track,
+  .trending-ticker:focus-within .trending-ticker-track {
+    animation-play-state: paused;
+  }
+  @keyframes cirkleTicker {
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
+  }
 }
 
 /* Accessibility: respect reduced-motion — disable animations + smooth
@@ -325,4 +347,5 @@
   html { scroll-behavior: auto !important; }
   .hero-spotlight { display: none !important; }
   .shimmer-overlay { display: none !important; }
+  .trending-ticker-track { animation: none !important; transform: none !important; }
 }

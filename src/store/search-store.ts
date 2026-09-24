@@ -32,6 +32,7 @@ import type {
   SafeSearch,
   SearchFilters,
   SearchMode,
+  SearchLens,
   SearchResponse,
   SeedCrawlResponse,
   SourceProfile,
@@ -68,12 +69,19 @@ export const DEFAULT_FILTERS: SearchFilters = {
 
 export const DEFAULT_MODE: SearchMode = 'BALANCED'
 
+/**
+ * Default search lens — BALANCED (no perspective bias). The Devil's Advocate
+ * lens is selected only when the user explicitly clicks it.
+ */
+export const DEFAULT_LENS: SearchLens = 'BALANCED'
+
 // --- Store shape ----------------------------------------------------------
 
 interface SearchState {
   // Core state
   query: string
   mode: SearchMode
+  lens: SearchLens
   filters: SearchFilters
   results: SearchResponse | null
   loading: boolean
@@ -121,6 +129,7 @@ interface SearchState {
   // Actions
   setQuery: (q: string) => void
   setMode: (m: SearchMode) => void
+  setLens: (l: SearchLens) => void
   setFilters: (patch: Partial<SearchFilters>) => void
   resetFilters: () => void
   toggleFilter: () => void
@@ -169,13 +178,14 @@ function isBrowser(): boolean {
 }
 
 /**
- * Push current query/mode/filters state into the URL via history.replaceState.
+ * Push current query/mode/lens/filters state into the URL via history.replaceState.
  * We DO NOT use the Next router — that would trigger a full re-render and
  * potentially re-fetch in some configurations.
  *
  * URL params emitted:
  *   ?q=        query
  *   ?mode=     SearchMode
+ *   ?lens=     SearchLens (only emitted when not BALANCED — keeps URLs clean)
  *   ?freshness= Freshness
  *   ?src=      comma-separated source types (only if non-empty)
  *   ?diversity= domainDiversity (0|1|2|3)
@@ -186,11 +196,17 @@ function isBrowser(): boolean {
  *   ?country=  country (if set)
  *   ?page=     page (only if > 1)
  */
-function writeUrl(state: { query: string; mode: SearchMode; filters: SearchFilters }) {
+function writeUrl(state: {
+  query: string
+  mode: SearchMode
+  lens: SearchLens
+  filters: SearchFilters
+}) {
   if (!isBrowser()) return
   const params = new URLSearchParams()
   if (state.query.trim()) params.set('q', state.query.trim())
   params.set('mode', state.mode)
+  if (state.lens && state.lens !== 'BALANCED') params.set('lens', state.lens)
   params.set('freshness', state.filters.freshness)
   if (state.filters.sourceTypes.length > 0) {
     params.set('src', state.filters.sourceTypes.join(','))
@@ -222,9 +238,10 @@ function writeUrl(state: { query: string; mode: SearchMode; filters: SearchFilte
 function parseFiltersFromUrl(): {
   query: string
   mode: SearchMode
+  lens: SearchLens
   filters: Partial<SearchFilters>
 } {
-  if (!isBrowser()) return { query: '', mode: DEFAULT_MODE, filters: {} }
+  if (!isBrowser()) return { query: '', mode: DEFAULT_MODE, lens: DEFAULT_LENS, filters: {} }
   const params = new URLSearchParams(window.location.search)
   const query = params.get('q') ?? ''
   const modeParam = params.get('mode') as SearchMode | null
@@ -241,6 +258,18 @@ function parseFiltersFromUrl(): {
   ]
   const mode: SearchMode =
     modeParam && validModes.includes(modeParam) ? modeParam : DEFAULT_MODE
+  const lensParam = params.get('lens') as SearchLens | null
+  const validLenses: SearchLens[] = [
+    'BALANCED',
+    'ACADEMIC',
+    'NEWS',
+    'PRIMARY',
+    'COMMUNITY',
+    'COMMERCIAL',
+    'DEVILS_ADVOCATE',
+  ]
+  const lens: SearchLens =
+    lensParam && validLenses.includes(lensParam) ? lensParam : DEFAULT_LENS
   const filters: Partial<SearchFilters> = {}
 
   const freshness = params.get('freshness') as Freshness | null
@@ -286,7 +315,7 @@ function parseFiltersFromUrl(): {
   if (from) filters.freshnessCustomStart = from
   if (to) filters.freshnessCustomEnd = to
 
-  return { query, mode, filters }
+  return { query, mode, lens, filters }
 }
 
 // --- Store ----------------------------------------------------------------
@@ -294,6 +323,7 @@ function parseFiltersFromUrl(): {
 export const useSearchStore = create<SearchState>((set, get) => ({
   query: '',
   mode: DEFAULT_MODE,
+  lens: DEFAULT_LENS,
   filters: { ...DEFAULT_FILTERS },
   results: null,
   loading: false,
@@ -335,6 +365,19 @@ export const useSearchStore = create<SearchState>((set, get) => ({
     set({ mode: m, filters: { ...get().filters, page: 1 } })
     get()._persistPrefs()
     // If we're already in an active results view, re-run with the new mode.
+    if (get().results || get().query.trim()) {
+      void get().executeSearch()
+    } else {
+      get()._writeUrl()
+    }
+  },
+
+  setLens: (l) => {
+    set({ lens: l, filters: { ...get().filters, page: 1 } })
+    get()._persistPrefs()
+    // If we're already in an active results view, re-run with the new lens.
+    // This is what makes the SearchLenses UI feel "live" — clicking a lens
+    // immediately re-ranks the result cards.
     if (get().results || get().query.trim()) {
       void get().executeSearch()
     } else {
@@ -405,6 +448,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
       const body = {
         query: q,
         mode: state.mode,
+        lens: state.lens,
         filters: state.filters,
       }
       const resp = await fetch('/api/search', {
@@ -589,6 +633,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
         body: JSON.stringify({
           query,
           mode,
+          lens: state.lens,
           filters,
           results: currentResults.results.slice(0, 8),
         }),
@@ -734,7 +779,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
 
   hydrateFromUrl: async () => {
     if (get()._hydrated) return
-    const { query, mode, filters } = parseFiltersFromUrl()
+    const { query, mode, lens, filters } = parseFiltersFromUrl()
     const merged: SearchFilters = { ...DEFAULT_FILTERS, ...filters }
     // Always load the personalization preference from localStorage when the
     // URL doesn't explicitly set it — this makes the personalization toggle
@@ -770,6 +815,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
     set({
       query,
       mode: query ? mode : mode, // always honor URL mode if present
+      lens,
       filters: merged,
       _hydrated: true,
     })
@@ -787,7 +833,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
   },
 
   _writeUrl: () => {
-    writeUrl({ query: get().query, mode: get().mode, filters: get().filters })
+    writeUrl({ query: get().query, mode: get().mode, lens: get().lens, filters: get().filters })
   },
 
   _persistPrefs: () => {

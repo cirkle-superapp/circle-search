@@ -60,7 +60,7 @@ import { assessQuality } from './quality-engine'
 import { detectSpam } from './spam-engine'
 import { findDuplicate } from './dedup'
 import { indexDocument, queryIndex, getAllDocsMap, makeSnippet, fetchContentForSnippets, invalidateIndexCache } from './indexer'
-import { rankCandidates, type SearchMode, type SearchFilters } from './ranking'
+import { rankCandidates, type SearchMode, type SearchFilters, type SearchLens } from './ranking'
 import { applyDiversity } from './diversity'
 import { parseQuery, expandQuery, type ParsedQuery } from './query-understanding'
 import { tokenize, removeStopwords, stem, contentHash, simhash, normalize } from './text-processor'
@@ -78,8 +78,8 @@ const SEARCH_CACHE_TTL_MS = 5 * 60_000
 interface CacheEntry { data: any; expiresAt: number }
 const _searchCache = new Map<string, CacheEntry>()
 
-function searchCacheKey(query: string, mode: string, filters: any): string {
-  return `${query.trim().toLowerCase()}|${mode}|${filters.freshness ?? 'ANY'}|${(filters.sourceTypes ?? []).join(',')}|${filters.domainDiversity ?? 2}|${filters.aiMode ?? 'AUTO'}|${filters.personalization ?? 'OFF'}|${filters.page ?? 1}`
+function searchCacheKey(query: string, mode: string, filters: any, lens: string = 'BALANCED'): string {
+  return `${query.trim().toLowerCase()}|${mode}|${lens}|${filters.freshness ?? 'ANY'}|${(filters.sourceTypes ?? []).join(',')}|${filters.domainDiversity ?? 2}|${filters.aiMode ?? 'AUTO'}|${filters.personalization ?? 'OFF'}|${filters.page ?? 1}`
 }
 
 function getSearchCache(key: string): any | null {
@@ -167,6 +167,20 @@ export interface IndexStats {
 export interface SearchResponse {
   query: string
   interpretedQuery: string
+  /**
+   * Structured query introspection — emitted alongside the interpretedQuery
+   * string so the frontend's QueryDna card can render the user's query as
+   * tokens / intent / entities / languages / countries without re-parsing.
+   */
+  parsed: {
+    tokens: string[]
+    phrases: string[]
+    exclusions: string[]
+    intent: string
+    entities: { text: string; type: string }[]
+    languages: string[]
+    countries: string[]
+  }
   tookMs: number // P2-1: search latency in ms
   totalFound: number // P2-1: total matching docs from index (pre-pagination)
   instantAnswer: InstantAnswer | null
@@ -530,15 +544,21 @@ export async function search(
   query: string,
   mode: SearchMode,
   filters: SearchFilters,
-  opts: { sessionId?: string; personalization: 'ON' | 'OFF' } = { personalization: 'OFF' }
+  opts: {
+    sessionId?: string
+    personalization: 'ON' | 'OFF'
+    /** Creative lens — algorithmic perspective shift. Default 'BALANCED'. */
+    lens?: SearchLens
+  } = { personalization: 'OFF' }
 ): Promise<SearchResponse> {
   const parsed = parseQuery(query)
+  const lens = opts.lens ?? 'BALANCED'
 
   // --- LRU cache check: if we've seen this exact query+mode+filters
   // recently, return the cached response in <1ms. This makes repeated
   // searches (autocomplete, back-button, pagination) instant. ---
   const _searchStart = Date.now()
-  const cacheKey = searchCacheKey(query, mode, filters)
+  const cacheKey = searchCacheKey(query, mode, filters, lens)
 
   // Tier 1: LRU in-memory cache (< 1ms, lost on restart)
   const cached = getSearchCache(cacheKey)
@@ -589,6 +609,15 @@ export async function search(
     return {
       query,
       interpretedQuery: parsed.tokens.join(' '),
+      parsed: {
+        tokens: parsed.tokens,
+        phrases: parsed.phrases,
+        exclusions: parsed.exclusions,
+        intent: parsed.intent,
+        entities: parsed.entities,
+        languages: parsed.languages,
+        countries: parsed.countries,
+      },
       tookMs: Date.now() - _searchStart, // P2-1
       totalFound: 0,                      // P2-1: tool path — no index hits
       instantAnswer: toolResult.instantAnswer,
@@ -722,7 +751,7 @@ export async function search(
     filters,
     parsed,
     dbDocsForRank as any,
-    { authorityMap }
+    { authorityMap, lens }
   )
 
   // Diversity
@@ -991,6 +1020,15 @@ export async function search(
   const response: SearchResponse = {
     query,
     interpretedQuery,
+    parsed: {
+      tokens: parsed.tokens,
+      phrases: parsed.phrases,
+      exclusions: parsed.exclusions,
+      intent: parsed.intent,
+      entities: parsed.entities,
+      languages: parsed.languages,
+      countries: parsed.countries,
+    },
     tookMs: Date.now() - _searchStart, // P2-1
     totalFound: finalRanked.length,    // P2-1: total matching docs from index (pre-pagination)
     instantAnswer,

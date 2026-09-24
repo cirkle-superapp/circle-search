@@ -36,6 +36,8 @@ import type { ParsedQuery } from './query-understanding'
 // via getAuthorityMap()). domain → 0..1 authority.
 export interface RankContext {
   authorityMap?: Map<string, number>
+  /** Search lens — algorithmic perspective shift. Default 'BALANCED'. */
+  lens?: SearchLens
 }
 
 export type SearchMode =
@@ -48,6 +50,85 @@ export type SearchMode =
   | 'COMMUNITY'
   | 'NEWS'
   | 'IMAGES'
+
+/**
+ * Search Lenses — algorithmic perspective-shifting (creative out-of-box feature).
+ *
+ * A lens re-weights the ranking signals to surface a specific perspective.
+ * The most creative lens is DEVILS_ADVOCATE — it INVERTS the lexical match
+ * signal so docs that DON'T match the user's tokens as strongly appear
+ * FIRST. This deliberately surfaces contrarian / dissenting / tangential
+ * views, which is uniquely valuable for controversial queries.
+ *
+ *   "Steve Jobs" with DEVILS_ADVOCATE → surfaces docs that mention Apple
+ *   critics, ex-employees, competitors, alternative viewpoints.
+ *
+ * Other lenses are weight-profile shifts (not inversions):
+ *   - ACADEMIC: boosts ACADEMIC/OFFICIAL source types + high qualityScore.
+ *   - NEWS: boosts recency + NEWS source type.
+ *   - PRIMARY: boosts PRIMARY source type (first-hand accounts).
+ *   - COMMUNITY: boosts COMMUNITY source type (forums, discussions).
+ *   - COMMERCIAL: boosts COMMERCIAL source type (product pages).
+ *   - BALANCED: no lens applied — standard ranking.
+ */
+export type SearchLens =
+  | 'BALANCED'
+  | 'ACADEMIC'
+  | 'NEWS'
+  | 'PRIMARY'
+  | 'COMMUNITY'
+  | 'COMMERCIAL'
+  | 'DEVILS_ADVOCATE'
+
+/** Lens metadata for the UI (icon, label, color, description). */
+export const LENS_METADATA: Record<
+  SearchLens,
+  { label: string; icon: string; color: string; description: string }
+> = {
+  BALANCED: {
+    label: 'Balanced',
+    icon: 'scale',
+    color: 'text-foreground',
+    description: 'Default mode-weighted ranking. No perspective bias.',
+  },
+  ACADEMIC: {
+    label: 'Academic',
+    icon: 'graduation-cap',
+    color: 'text-teal',
+    description: 'Boosts peer-reviewed + official sources. Surfaces primary research.',
+  },
+  NEWS: {
+    label: 'News',
+    icon: 'newspaper',
+    color: 'text-rose',
+    description: 'Boosts recency + news sources. Best for current events.',
+  },
+  PRIMARY: {
+    label: 'Primary',
+    icon: 'file-text',
+    color: 'text-gold',
+    description: 'Boosts first-hand accounts + primary sources. Direct evidence.',
+  },
+  COMMUNITY: {
+    label: 'Community',
+    icon: 'users',
+    color: 'text-steel',
+    description: 'Boosts forums, discussions, Q&A sites. Lived experience.',
+  },
+  COMMERCIAL: {
+    label: 'Commercial',
+    icon: 'shopping-bag',
+    color: 'text-gold',
+    description: 'Boosts product pages + commercial sources. Buyer intent.',
+  },
+  DEVILS_ADVOCATE: {
+    label: "Devil's Advocate",
+    icon: 'flame',
+    color: 'text-rose',
+    description:
+      'INVERTS the ranking to surface dissenting, contrarian, and tangential views. For controversial queries, this surfaces the perspectives the standard ranking would bury.',
+  },
+}
 
 export interface SearchFilters {
   freshness: 'ANY' | 'HOUR' | 'DAY' | 'WEEK' | 'MONTH' | 'YEAR' | 'CUSTOM'
@@ -278,10 +359,54 @@ export async function rankCandidates(
     // Exception: if the semantic boost is high (>0.4), keep the doc even if
     // its lexical score is low — it's semantically relevant despite poor
     // token match (e.g. "iphone" query → "Apple smartphone" doc).
-    if (lex < RELEVANCE_THRESHOLD && sem < 0.4 && mode !== 'IMAGES') {
+    // EXCEPTION: DEVILS_ADVOCATE lens KEEPS near-miss candidates (the whole
+    // point is to surface docs that don't strongly match — contrarian views
+    // often DON'T share tokens with the user's framing).
+    const lens = ctx?.lens ?? 'BALANCED'
+    const isDevilsAdvocate = lens === 'DEVILS_ADVOCATE'
+    if (!isDevilsAdvocate && lex < RELEVANCE_THRESHOLD && sem < 0.4 && mode !== 'IMAGES') {
       // For IMAGE mode, keep all candidates (image results are based on
       // og:image presence, not token relevance).
       continue
+    }
+
+    // --- Lens re-weighting (creative out-of-box feature) ---
+    // Each lens applies a different weight profile to the signals.
+    // DEVILS_ADVOCATE: INVERTS the lexical signal (1 - lex) so docs that
+    //   DON'T match as strongly surface FIRST. Plus boosts COMMUNITY + NEWS
+    //   source types (where dissent typically lives).
+    // Other lenses: standard re-weighting.
+    let lexWeight = 0.30, semWeight = 0.18, qWeight = 0.15, frWeight = 0.10,
+        stWeight = 0.09, orWeight = 0.05, intentWeight = 0.05, authWeight = 0.08
+    let sourceTypeBoost = 0  // additive boost for the lens's preferred source type
+    let lexForScoring = lex  // the lexical value to use in the score formula
+    if (isDevilsAdvocate) {
+      // INVERT: low-BM25 docs surface first (the contrarian / dissenting / tangential views)
+      lexForScoring = 1 - lex
+      // Boost dissent-typical source types
+      if (doc.sourceType === 'COMMUNITY') sourceTypeBoost += 0.20
+      if (doc.sourceType === 'NEWS') sourceTypeBoost += 0.10
+      // De-emphasize lexical (already inverted) + boost quality + originality
+      // (we want well-argued dissent, not spam)
+      lexWeight = 0.15; semWeight = 0.10; qWeight = 0.25; frWeight = 0.05
+      stWeight = 0.05; orWeight = 0.15; intentWeight = 0.05; authWeight = 0.10
+    } else if (lens === 'ACADEMIC') {
+      if (doc.sourceType === 'ACADEMIC' || doc.sourceType === 'OFFICIAL' || doc.sourceType === 'GOVERNMENT') {
+        sourceTypeBoost += 0.25
+      }
+      qWeight = 0.30; lexWeight = 0.20; semWeight = 0.10; frWeight = 0.05
+    } else if (lens === 'NEWS') {
+      if (doc.sourceType === 'NEWS') sourceTypeBoost += 0.25
+      frWeight = 0.30; lexWeight = 0.15; semWeight = 0.10; qWeight = 0.10
+    } else if (lens === 'PRIMARY') {
+      if (doc.sourceType === 'PRIMARY') sourceTypeBoost += 0.30
+      orWeight = 0.25; lexWeight = 0.20; qWeight = 0.15
+    } else if (lens === 'COMMUNITY') {
+      if (doc.sourceType === 'COMMUNITY') sourceTypeBoost += 0.30
+      lexWeight = 0.20; semWeight = 0.20; qWeight = 0.10
+    } else if (lens === 'COMMERCIAL') {
+      if (doc.sourceType === 'COMMERCIAL') sourceTypeBoost += 0.30
+      lexWeight = 0.20; qWeight = 0.20; frWeight = 0.10
     }
 
     let score = 0
@@ -290,20 +415,20 @@ export async function rankCandidates(
         // When the query has freshness intent (today/latest/breaking/news),
         // boost the freshness weight from 0.10 → 0.25 and reduce lexical.
         if (hasFreshnessIntent) {
-          score = 0.22 * lex + 0.13 * sem + 0.15 * q + 0.25 * fr + 0.08 * st + 0.05 * or + 0.05 * intent + 0.07 * auth
+          score = 0.22 * lexForScoring + 0.13 * sem + 0.15 * q + 0.25 * fr + 0.08 * st + 0.05 * or + 0.05 * intent + 0.07 * auth
         } else {
-          score = 0.30 * lex + 0.18 * sem + 0.15 * q + 0.10 * fr + 0.09 * st + 0.05 * or + 0.05 * intent + 0.08 * auth
+          score = lexWeight * lexForScoring + semWeight * sem + qWeight * q + frWeight * fr + stWeight * st + orWeight * or + intentWeight * intent + authWeight * auth
         }
         break
       case 'EXACT':
-        score = 0.65 * lex + 0.10 * fr + 0.10 * q + 0.08 * st + 0.07 * auth
+        score = 0.65 * lexForScoring + 0.10 * fr + 0.10 * q + 0.08 * st + 0.07 * auth
         break
       case 'LATEST':
-        score = 0.45 * fr + 0.18 * lex + 0.18 * q + 0.09 * st + 0.10 * auth
+        score = 0.45 * fr + 0.18 * lexForScoring + 0.18 * q + 0.09 * st + 0.10 * auth
         break
       case 'RESEARCH': {
         const acBoost = (doc.sourceType === 'ACADEMIC' || doc.sourceType === 'OFFICIAL' || doc.sourceType === 'GOVERNMENT') ? 1 : 0
-        score = 0.35 * q + 0.18 * acBoost + 0.18 * lex + 0.09 * or + 0.10 * fr + 0.10 * auth
+        score = 0.35 * q + 0.18 * acBoost + 0.18 * lexForScoring + 0.09 * or + 0.10 * fr + 0.10 * auth
         break
       }
       case 'OFFICIAL':
@@ -313,11 +438,14 @@ export async function rankCandidates(
       case 'IMAGES':
         // Filter to sourceType happens at candidate retrieval (in search()).
         // For ranking, apply uniform weights.
-        score = 0.36 * lex + 0.28 * q + 0.18 * st + 0.10 * fr + 0.08 * auth
+        score = 0.36 * lexForScoring + 0.28 * q + 0.18 * st + 0.10 * fr + 0.08 * auth
         break
       default:
-        score = lex
+        score = lexForScoring
     }
+
+    // Apply the lens's source-type boost (additive).
+    score += sourceTypeBoost
 
     // Penalties
     score = score - spam - dup

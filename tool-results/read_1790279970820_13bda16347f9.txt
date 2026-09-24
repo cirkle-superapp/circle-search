@@ -1,0 +1,1236 @@
+     1→/**
+     2→ * index.ts
+     3→ * -----------------------------------------------------------------------------
+     4→ * Orchestrator for the search engine. Re-exports the public API + types
+     5→ * and provides:
+     6→ *
+     7→ *   - indexDocumentFromCrawl(rawUrl, rawHtml, finalUrl, contentType)
+     8→ *       The full document processing pipeline:
+     9→ *         canonicalize → parseHtml → classifySource → quality+spam+dedup →
+    10→ *         upsert Document → indexDocument (postings) → extract links →
+    11→ *         upsert Link rows. Marks CrawlQueue row done.
+    12→ *
+    13→ *   - search(query, mode, filters, opts)
+    14→ *       The main entry. Implements §3 candidate retrieval → ranking →
+    15→ *       diversity → assembly. Returns the full SearchResponse shape from
+    16→ *       the API contract in worklog.md.
+    17→ *
+    18→ *   - getSource(id), getStats()
+    19→ *       Helpers for /api/source/[id] and /api/stats endpoints.
+    20→ *
+    21→ * All LLM traffic flows through the unified LLM client at `@/lib/llm`
+    22→ * (Groq → Gemini → OpenRouter fallback chain). Server-side only.
+    23→ * -----------------------------------------------------------------------------
+    24→ */
+    25→
+    26→import { db } from '@/lib/db'
+    27→
+    28→// --- Public re-exports ----------------------------------------------------
+    29→export type { ParsedQuery, QueryIntent, SourceType } from './query-understanding'
+    30→export { parseQuery, expandQuery } from './query-understanding'
+    31→export type { SearchMode, SearchFilters, RankInput, RankedResult } from './ranking'
+    32→export { rankCandidates } from './ranking'
+    33→export { tokenize, normalize, stem, contentHash, simhash } from './text-processor'
+    34→export { fetchUrl, checkRobots, extractSitemapUrls } from './crawler'
+    35→export { canonicalizeUrl, extractDomain, registeredDomain } from './canonical'
+    36→export { parseHtml } from './html-parser'
+    37→export type { ParsedDoc, ParsedHeading, ParsedLink } from './html-parser'
+    38→export { classifySource, classifyUrl } from './source-classifier'
+    39→export { assessQuality } from './quality-engine'
+    40→export type { QualitySignals, QualityInput } from './quality-engine'
+    41→export { detectSpam } from './spam-engine'
+    42→export type { SpamVerdict, SpamInput } from './spam-engine'
+    43→export { findDuplicate, hammingDistance64 } from './dedup'
+    44→export type { DedupResult } from './dedup'
+    45→export { indexDocument, queryIndex, invalidateIndexCache, getAllDocsMap, getDocCount, makeSnippet, fetchContentForSnippets, reindexAll } from './indexer'
+    46→export type { QueryHit, Posting } from './indexer'
+    47→export { applyDiversity } from './diversity'
+    48→export type { DiversityResult, DiversityCluster } from './diversity'
+    49→export { generateAISummary, generateResearchReport, summarizePage } from './ai-search'
+    50→export type { AISearchResult, ResearchReport, AICitation, AIClaim, AIConflict, KnowledgeCard, PageSummary } from './ai-search'
+    51→export { SEED_URLS, seedCrawl } from './seed'
+    52→export { LARGE_SEED_URLS, RSS_FEED_URLS } from './large-seed'
+    53→export { suggest, getTrendingSearches } from './suggest'
+    54→export { recordSearch, recordAILayer, getMetrics } from './metrics'
+    55→
+    56→import { canonicalizeUrl, extractDomain, registeredDomain } from './canonical'
+    57→import { parseHtml, type ParsedDoc } from './html-parser'
+    58→import { classifyUrl } from './source-classifier'
+    59→import { assessQuality } from './quality-engine'
+    60→import { detectSpam } from './spam-engine'
+    61→import { findDuplicate } from './dedup'
+    62→import { indexDocument, queryIndex, getAllDocsMap, makeSnippet, fetchContentForSnippets, invalidateIndexCache } from './indexer'
+    63→import { rankCandidates, type SearchMode, type SearchFilters, type SearchLens } from './ranking'
+    64→import { applyDiversity } from './diversity'
+    65→import { parseQuery, expandQuery, type ParsedQuery } from './query-understanding'
+    66→import { tokenize, removeStopwords, stem, contentHash, simhash, normalize } from './text-processor'
+    67→import { generateAISummary, generateKnowledgeCard, type AISearchResult, type KnowledgeCard } from './ai-search'
+    68→import { runTool, runLiveWebSearch, shouldLiveWebFallback, type InstantAnswer, type LiveWebResult } from './tools'
+    69→import { recordSearch } from './metrics'
+    70→import { LARGE_SEED_URLS } from './large-seed'
+    71→
+    72→// --- LRU search-result cache ----------------------------------------------
+    73→// Caches the full SearchResponse for repeated queries so the second+ search
+    74→// for the same query+mode+filters returns in <5ms instead of re-running BM25.
+    75→// Capped at 200 entries, TTL 5 minutes (so fresh crawls eventually show up).
+    76→const SEARCH_CACHE_MAX = 200
+    77→const SEARCH_CACHE_TTL_MS = 5 * 60_000
+    78→interface CacheEntry { data: any; expiresAt: number }
+    79→const _searchCache = new Map<string, CacheEntry>()
+    80→
+    81→function searchCacheKey(query: string, mode: string, filters: any, lens: string = 'BALANCED'): string {
+    82→  return `${query.trim().toLowerCase()}|${mode}|${lens}|${filters.freshness ?? 'ANY'}|${(filters.sourceTypes ?? []).join(',')}|${filters.domainDiversity ?? 2}|${filters.aiMode ?? 'AUTO'}|${filters.personalization ?? 'OFF'}|${filters.page ?? 1}`
+    83→}
+    84→
+    85→function getSearchCache(key: string): any | null {
+    86→  const entry = _searchCache.get(key)
+    87→  if (!entry) return null
+    88→  if (entry.expiresAt < Date.now()) {
+    89→    _searchCache.delete(key)
+    90→    return null
+    91→  }
+    92→  // Move to end (LRU — most recently used stays)
+    93→  _searchCache.delete(key)
+    94→  _searchCache.set(key, entry)
+    95→  return entry.data
+    96→}
+    97→
+    98→function setSearchCache(key: string, data: any): void {
+    99→  if (_searchCache.size >= SEARCH_CACHE_MAX) {
+   100→    // Evict oldest entry (first key in insertion order)
+   101→    const firstKey = _searchCache.keys().next().value
+   102→    if (firstKey) _searchCache.delete(firstKey)
+   103→  }
+   104→  _searchCache.set(key, { data, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS })
+   105→}
+   106→
+   107→/** Invalidate the search cache — call after a seed crawl so fresh results show. */
+   108→export function invalidateSearchCache(): void {
+   109→  _searchCache.clear()
+   110→}
+   111→
+   112→// --- Shared result types ---------------------------------------------------
+   113→
+   114→export interface SearchResult {
+   115→  id: string
+   116→  title: string
+   117→  url: string
+   118→  domain: string
+   119→  snippet: string
+   120→  sourceType: string
+   121→  publishedAt: string | null
+   122→  updatedAt: string | null
+   123→  language: string
+   124→  country: string | null
+   125→  isOriginal: boolean
+   126→  clusterId: string | null
+   127→  clusterSize: number
+   128→  whyThisResult: string[]
+   129→  relevanceScore: number
+   130→  qualityScore: number
+   131→  author: string | null
+   132→  docType: string
+   133→  ogImage: string | null
+   134→}
+   135→
+   136→export interface SearchSponsored {
+   137→  id: string
+   138→  advertiser: string
+   139→  headline: string
+   140→  displayUrl: string
+   141→  targetUrl: string
+   142→  snippet: string
+   143→  whyAdReason: string
+   144→}
+   145→
+   146→export interface SearchCluster {
+   147→  id: string
+   148→  primaryId: string
+   149→  size: number
+   150→  suppressedIds: string[]
+   151→}
+   152→
+   153→export interface SearchPagination {
+   154→  page: number
+   155→  pageSize: number
+   156→  totalResults: number
+   157→  totalPages: number
+   158→}
+   159→
+   160→export interface IndexStats {
+   161→  documents: number
+   162→  domains: number
+   163→  indexSize: number // bytes of inverted-index JSON (approximate)
+   164→  lastCrawl: string | null
+   165→}
+   166→
+   167→export interface SearchResponse {
+   168→  query: string
+   169→  interpretedQuery: string
+   170→  tookMs: number // P2-1: search latency in ms
+   171→  totalFound: number // P2-1: total matching docs from index (pre-pagination)
+   172→  instantAnswer: InstantAnswer | null
+   173→  liveWebResults: LiveWebResult[]
+   174→  aiAnswer: AISearchResult | null
+   175→  knowledgeCard: KnowledgeCard | null
+   176→  sponsored: SearchSponsored[]
+   177→  results: SearchResult[]
+   178→  clusters: SearchCluster[]
+   179→  relatedQuestions: string[]
+   180→  didYouMean: string | null
+   181→  pagination: SearchPagination
+   182→  personalized: boolean
+   183→  personalizationFactors: string[]
+   184→  indexStats: IndexStats
+   185→}
+   186→
+   187→// --- Document pipeline ----------------------------------------------------
+   188→
+   189→export interface IndexResult {
+   190→  docId?: string
+   191→  error?: string
+   192→}
+   193→
+   194→/**
+   195→ * Index a freshly-fetched HTML document.
+   196→ *
+   197→ * Pipeline: canonicalize → parseHtml → classifySource → quality+spam+dedup →
+   198→ * upsert Document → indexDocument (postings) → extract links → upsert Link
+   199→ * rows. Marks CrawlQueue row done.
+   200→ */
+   201→export async function indexDocumentFromCrawl(
+   202→  rawUrl: string,
+   203→  rawHtml: string,
+   204→  finalUrl: string,
+   205→  _contentType: string
+   206→): Promise<IndexResult> {
+   207→  if (!rawHtml) return { error: 'empty content' }
+   208→
+   209→  const canonUrl = canonicalizeUrl(finalUrl || rawUrl)
+   210→  if (!canonUrl) return { error: 'invalid URL' }
+   211→
+   212→  const domain = extractDomain(canonUrl) ?? ''
+   213→  const registeredDom = registeredDomain(canonUrl) ?? domain
+   214→
+   215→  const parsed: ParsedDoc = parseHtml(rawHtml, canonUrl)
+   216→  if (!parsed.title && parsed.wordCount < 50) {
+   217→    return { error: 'low signal — no title and very little content' }
+   218→  }
+   219→
+   220→  // Source classification
+   221→  const classification = classifyUrl(canonUrl, parsed)
+   222→  const sourceType = classification.sourceType
+   223→
+   224→  // Content hashes
+   225→  const textForHash = (parsed.bodyText || parsed.title || canonUrl)
+   226→  const chash = contentHash(textForHash)
+   227→  const shash = simhash(textForHash)
+   228→
+   229→  // Quality + spam
+   230→  const qSignals = assessQuality({
+   231→    contentText: parsed.bodyText,
+   232→    wordCount: parsed.wordCount,
+   233→    headings: parsed.headings,
+   234→    metaDescription: parsed.metaDescription,
+   235→    title: parsed.title,
+   236→    crawledAt: new Date(),
+   237→    publishedAt: parsed.publishedAt ? new Date(parsed.publishedAt) : null,
+   238→    updatedAt: parsed.updatedAt ? new Date(parsed.updatedAt) : null,
+   239→    author: parsed.author,
+   240→    publisher: parsed.publisher,
+   241→    linkCount: parsed.links.length,
+   242→    domain: registeredDom,
+   243→  })
+   244→
+   245→  const spam = detectSpam({
+   246→    contentText: parsed.bodyText,
+   247→    title: parsed.title,
+   248→    metaKeywords: parsed.metaKeywords,
+   249→    links: parsed.links,
+   250→    domain: registeredDom,
+   251→    url: canonUrl,
+   252→  })
+   253→
+   254→  // Dedup
+   255→  const dedup = await findDuplicate(chash, shash, parsed.title, registeredDom)
+   256→  const isOriginal = !dedup.isExactDuplicate && !dedup.isNearDuplicate
+   257→  const clusterId = dedup.clusterKey
+   258→
+   259→  // Snippet — prefer meta description, else first ~160 chars of body
+   260→  let snippet = parsed.metaDescription ?? ''
+   261→  if (!snippet && parsed.bodyText) {
+   262→    snippet = parsed.bodyText.slice(0, 200)
+   263→  }
+   264→
+   265→  const headingsJson = JSON.stringify(parsed.headings.slice(0, 50))
+   266→
+   267→  // Upsert Document (by URL)
+   268→  let doc
+   269→  try {
+   270→    doc = await db.document.upsert({
+   271→      where: { url: canonUrl },
+   272→      create: {
+   273→        url: canonUrl,
+   274→        canonicalUrl: parsed.canonicalUrl,
+   275→        domain,
+   276→        title: parsed.title || canonUrl,
+   277→        snippet,
+   278→        contentText: parsed.bodyText,
+   279→        headings: headingsJson,
+   280→        links: '[]', // set below
+   281→        metaDescription: parsed.metaDescription,
+   282→        metaKeywords: parsed.metaKeywords,
+   283→        ogType: parsed.ogType,
+   284→        ogImage: parsed.ogImage,
+   285→        sourceType,
+   286→        language: parsed.language || 'en',
+   287→        country: classification.country ?? null,
+   288→        author: classification.author ?? parsed.author,
+   289→        publisher: classification.publisher ?? domain,
+   290→        publishedAt: parsed.publishedAt ? new Date(parsed.publishedAt) : null,
+   291→        updatedAt: parsed.updatedAt ? new Date(parsed.updatedAt) : null,
+   292→        crawledAt: new Date(),
+   293→        contentHash: chash,
+   294→        simhash: shash,
+   295→        clusterId,
+   296→        qualityScore: qSignals.qualityScore,
+   297→        spamScore: spam.spamScore,
+   298→        isOriginal,
+   299→        wordCount: parsed.wordCount,
+   300→      },
+   301→      update: {
+   302→        canonicalUrl: parsed.canonicalUrl,
+   303→        title: parsed.title || canonUrl,
+   304→        snippet,
+   305→        contentText: parsed.bodyText,
+   306→        headings: headingsJson,
+   307→        metaDescription: parsed.metaDescription,
+   308→        metaKeywords: parsed.metaKeywords,
+   309→        ogType: parsed.ogType,
+   310→        ogImage: parsed.ogImage,
+   311→        sourceType,
+   312→        country: classification.country ?? null,
+   313→        author: classification.author ?? parsed.author,
+   314→        publisher: classification.publisher ?? domain,
+   315→        publishedAt: parsed.publishedAt ? new Date(parsed.publishedAt) : null,
+   316→        updatedAt: parsed.updatedAt ? new Date(parsed.updatedAt) : null,
+   317→        crawledAt: new Date(),
+   318→        contentHash: chash,
+   319→        simhash: shash,
+   320→        clusterId,
+   321→        qualityScore: qSignals.qualityScore,
+   322→        spamScore: spam.spamScore,
+   323→        isOriginal,
+   324→        wordCount: parsed.wordCount,
+   325→      },
+   326→      select: { id: true },
+   327→    })
+   328→  } catch (e: any) {
+   329→    return { error: 'db upsert failed: ' + (e?.message ?? String(e)) }
+   330→  }
+   331→
+   332→  // Index postings
+   333→  try {
+   334→    await indexDocument(doc.id, parsed.bodyText, parsed.title, parsed.headings)
+   335→    invalidateIndexCache()
+   336→  } catch (e: any) {
+   337→    return { error: 'indexing failed: ' + (e?.message ?? String(e)) }
+   338→  }
+   339→
+   340→  // Extract links → upsert Link rows (in batches)
+   341→  try {
+   342→    const links = parsed.links.slice(0, 200)
+   343→    if (links.length > 0) {
+   344→      // Delete old links for this source URL then create new ones
+   345→      await db.link.deleteMany({ where: { sourceUrl: canonUrl } })
+   346→      await db.link.createMany({
+   347→        data: links.map((l) => ({
+   348→          sourceUrl: canonUrl,
+   349→          targetUrl: l.url,
+   350→          anchorText: (l.anchor || '').slice(0, 300),
+   351→          relationship:
+   352→            l.rel && /nofollow/i.test(l.rel) ? 'nofollow' :
+   353→            l.rel && /sponsored/i.test(l.rel) ? 'sponsor' :
+   354→            l.rel && /ugc/i.test(l.rel) ? 'ugc' : 'follow',
+   355→        })),
+   356→      })
+   357→    }
+   358→  } catch {
+   359→    // non-fatal — we already have the doc indexed
+   360→  }
+   361→
+   362→  // Mark CrawlQueue done if a row exists
+   363→  try {
+   364→    await db.crawlQueue.updateMany({
+   365→      where: { OR: [{ url: canonUrl }, { url: rawUrl }] },
+   366→      data: { status: 'done', httpStatus: 200, contentHash: chash, lastCrawledAt: new Date() },
+   367→    })
+   368→  } catch {
+   369→    // ignore
+   370→  }
+   371→
+   372→  return { docId: doc.id }
+   373→}
+   374→
+   375→// --- Search ---------------------------------------------------------------
+   376→
+   377→/**
+   378→ * Levenshtein distance — used for "Did you mean?" suggestions.
+   379→ */
+   380→function levenshtein(a: string, b: string): number {
+   381→  const m = a.length
+   382→  const n = b.length
+   383→  if (m === 0) return n
+   384→  if (n === 0) return m
+   385→  const prev = new Array(n + 1)
+   386→  for (let j = 0; j <= n; j++) prev[j] = j
+   387→  for (let i = 1; i <= m; i++) {
+   388→    let prevSub = prev[0]
+   389→    prev[0] = i
+   390→    for (let j = 1; j <= n; j++) {
+   391→      const tmp = prev[j]
+   392→      prev[j] = Math.min(
+   393→        prev[j] + 1,         // deletion
+   394→        prev[j - 1] + 1,     // insertion
+   395→        prevSub + (a[i - 1] === b[j - 1] ? 0 : 1) // substitution
+   396→      )
+   397→      prevSub = tmp
+   398→    }
+   399→  }
+   400→  return prev[n]
+   401→}
+   402→
+   403→interface DocRow {
+   404→  id: string
+   405→  url: string
+   406→  domain: string
+   407→  title: string
+   408→  sourceType: string
+   409→  language: string
+   410→  country: string | null
+   411→  publishedAt: Date | null
+   412→  updatedAt: Date | null
+   413→  crawledAt: Date
+   414→  qualityScore: number
+   415→  spamScore: number
+   416→  isOriginal: boolean
+   417→  clusterId: string | null
+   418→  wordCount: number
+   419→  author: string | null
+   420→  publisher: string | null
+   421→  indexTerms: string | null
+   422→  snippet: string
+   423→}
+   424→
+   425→function passesFreshnessFilter(doc: DocRow, filters: SearchFilters, parsed: ParsedQuery): boolean {
+   426→  // Wire the after:/before: operators from the parsed query.
+   427→  if (parsed.dateRange) {
+   428→    const ref = doc.updatedAt ?? doc.publishedAt
+   429→    if (!ref) return false // date range specified but doc has no date → exclude
+   430→    const t = new Date(ref).getTime()
+   431→    if (parsed.dateRange.start && t < new Date(parsed.dateRange.start).getTime()) return false
+   432→    if (parsed.dateRange.end && t > new Date(parsed.dateRange.end).getTime()) return false
+   433→  }
+   434→  if (filters.freshness === 'ANY') return true
+   435→  const ref = doc.updatedAt ?? doc.publishedAt
+   436→  // Don't filter out undated content — it might be evergreen/recent.
+   437→  // Only filter docs that HAVE a date but are older than the threshold.
+   438→  if (!ref) return true
+   439→  const ms = Date.now() - new Date(ref).getTime()
+   440→  const HOUR = 60 * 60 * 1000
+   441→  const DAY = 24 * HOUR
+   442→  switch (filters.freshness) {
+   443→    case 'HOUR': return ms <= HOUR
+   444→    case 'DAY': return ms <= DAY
+   445→    case 'WEEK': return ms <= 7 * DAY
+   446→    case 'MONTH': return ms <= 30 * DAY
+   447→    case 'YEAR': return ms <= 365 * DAY
+   448→    case 'CUSTOM': {
+   449→      const start = filters.freshnessCustomStart ? new Date(filters.freshnessCustomStart).getTime() : -Infinity
+   450→      const end = filters.freshnessCustomEnd ? new Date(filters.freshnessCustomEnd).getTime() : Infinity
+   451→      const t = new Date(ref).getTime()
+   452→      return t >= start && t <= end
+   453→    }
+   454→    default: return true
+   455→  }
+   456→}
+   457→
+   458→function passesLanguageFilter(doc: DocRow, filters: SearchFilters, parsed: ParsedQuery): boolean {
+   459→  // Wire the lang: operator from the parsed query.
+   460→  const lang = filters.language || parsed.languages?.[0]
+   461→  if (!lang) return true
+   462→  return (doc.language ?? '').toLowerCase().startsWith(lang.toLowerCase())
+   463→}
+   464→
+   465→function passesCountryFilter(doc: DocRow, filters: SearchFilters, parsed: ParsedQuery): boolean {
+   466→  // Wire the region: operator from the parsed query.
+   467→  const country = filters.country || parsed.countries?.[0]
+   468→  if (!country) return true
+   469→  return (doc.country ?? '').toLowerCase() === country.toLowerCase()
+   470→}
+   471→
+   472→function passesFileTypeFilter(doc: DocRow, parsed: ParsedQuery): boolean {
+   473→  // Wire the filetype: operator from the parsed query.
+   474→  if (!parsed.filetype) return true
+   475→  const ext = parsed.filetype.toLowerCase()
+   476→  if (ext === 'pdf') return doc.url.toLowerCase().endsWith('.pdf')
+   477→  if (ext === 'doc' || ext === 'docx') return doc.url.toLowerCase().match(/\.docx?$/)
+   478→  return true
+   479→}
+   480→
+   481→function passesSafeSearchFilter(doc: DocRow, filters: SearchFilters): boolean {
+   482→  // SafeSearch ON: filter out docs with high spam scores (adult content / spam).
+   483→  if (filters.safeSearch !== 'ON') return true
+   484→  return (doc.spamScore ?? 0) < 0.5
+   485→}
+   486→
+   487→function passesSourceTypeFilter(doc: DocRow, mode: SearchMode, filters: SearchFilters, parsed: ParsedQuery): boolean {
+   488→  const modeTypes: SearchMode[] = ['OFFICIAL', 'ACADEMIC', 'COMMUNITY', 'NEWS']
+   489→  // Wire the official:/academic:/etc source-preference operators.
+   490→  if (parsed.sourcePreference && modeTypes.includes(parsed.sourcePreference as SearchMode)) {
+   491→    if (doc.sourceType !== parsed.sourcePreference) return false
+   492→  }
+   493→  if (modeTypes.includes(mode)) {
+   494→    if (doc.sourceType !== mode) return false
+   495→  }
+   496→  if (mode === 'IMAGES') {
+   497→    if (!doc.ogImage) return false
+   498→  }
+   499→  if (filters.sourceTypes && filters.sourceTypes.length > 0) {
+   500→    if (!filters.sourceTypes.includes(doc.sourceType)) return false
+   501→  }
+   502→  return true
+   503→}
+   504→
+   505→function passesSiteFilter(doc: DocRow, parsed: ParsedQuery): boolean {
+   506→  if (!parsed.site) return true
+   507→  return doc.domain.toLowerCase().endsWith(parsed.site.toLowerCase()) ||
+   508→    doc.domain.toLowerCase().includes(parsed.site.toLowerCase())
+   509→}
+   510→
+   511→function docTypeFromUrl(url: string): string {
+   512→  try {
+   513→    const u = new URL(url)
+   514→    const m = u.pathname.toLowerCase().match(/\.(pdf|docx?|pptx?|xlsx?|rtf|odt|tex)$/i)
+   515→    if (m) return m[1].toUpperCase()
+   516→    if (u.pathname.toLowerCase().endsWith('.pdf')) return 'PDF'
+   517→  } catch {
+   518→    // ignore
+   519→  }
+   520→  return ''
+   521→}
+   522→
+   523→/**
+   524→ * The main search entry. Returns the full SearchResponse.
+   525→ *
+   526→ * opts.personalization — when 'OFF', no user-specific signals are used
+   527→ * (only language/region from the filters, not from history).
+   528→ */
+   529→export async function search(
+   530→  query: string,
+   531→  mode: SearchMode,
+   532→  filters: SearchFilters,
+   533→  opts: {
+   534→    sessionId?: string
+   535→    personalization: 'ON' | 'OFF'
+   536→    /** Creative lens — algorithmic perspective shift. Default 'BALANCED'. */
+   537→    lens?: SearchLens
+   538→  } = { personalization: 'OFF' }
+   539→): Promise<SearchResponse> {
+   540→  const parsed = parseQuery(query)
+   541→  const lens = opts.lens ?? 'BALANCED'
+   542→
+   543→  // --- LRU cache check: if we've seen this exact query+mode+filters
+   544→  // recently, return the cached response in <1ms. This makes repeated
+   545→  // searches (autocomplete, back-button, pagination) instant. ---
+   546→  const _searchStart = Date.now()
+   547→  const cacheKey = searchCacheKey(query, mode, filters, lens)
+   548→
+   549→  // Tier 1: LRU in-memory cache (< 1ms, lost on restart)
+   550→  const cached = getSearchCache(cacheKey)
+   551→  if (cached) {
+   552→    void recordSearch({ query, mode, latencyMs: Date.now() - _searchStart, resultCount: cached.results?.length ?? 0, cacheHit: true, toolUsed: cached.instantAnswer?.kind ?? null })
+   553→    return {
+   554→      ...cached,
+   555→      query,
+   556→      tookMs: Date.now() - _searchStart, // P2-1: report real latency for cache hits too
+   557→      totalFound: cached.pagination?.totalResults ?? cached.results?.length ?? 0,
+   558→    }
+   559→  }
+   560→
+   561→  // NOTE: Neon persistent cache READ is intentionally NOT in the hot path.
+   562→  // In the sandbox, the Neon HTTP connection times out (~2s), adding
+   563→  // unacceptable latency. The Neon WRITE is fire-and-forget (after search
+   564→  // completes). In production (Vercel), where Neon is fast, a separate
+   565→  // edge-middleware can check the Neon cache before hitting the search API.
+   566→
+   567→  // --- Fast path: if a real-time tool matches (weather / time / math),
+   568→  // run it immediately + skip the index retrieval entirely. This makes
+   569→  // "weather in Dubai" or "2+2" answer in ~1-3s instead of 15s. ---
+   570→  const toolResult = await runTool(query)
+   571→  if (toolResult.instantAnswer) {
+   572→    // Tool matched — return the instant answer + empty results immediately.
+   573→    const indexStats: IndexStats = {
+   574→      documents: 0,
+   575→      domains: 0,
+   576→      indexSize: 0,
+   577→      lastCrawl: null,
+   578→    }
+   579→    try {
+   580→      const fastStats = getStatsFast()
+   581→      if (fastStats) Object.assign(indexStats, fastStats)
+   582→    } catch { /* ignore */ }
+   583→
+   584→    // P1-2: record tool-path metrics BEFORE the return — the previous code
+   585→    // had an unreachable recordSearch + duplicate return block here.
+   586→    void recordSearch({
+   587→      query,
+   588→      mode,
+   589→      latencyMs: Date.now() - _searchStart,
+   590→      resultCount: 0,
+   591→      cacheHit: false,
+   592→      toolUsed: toolResult.instantAnswer.kind,
+   593→    })
+   594→
+   595→    return {
+   596→      query,
+   597→      interpretedQuery: parsed.tokens.join(' '),
+   598→      tookMs: Date.now() - _searchStart, // P2-1
+   599→      totalFound: 0,                      // P2-1: tool path — no index hits
+   600→      instantAnswer: toolResult.instantAnswer,
+   601→      liveWebResults: [],
+   602→      aiAnswer: null,
+   603→      knowledgeCard: null,
+   604→      sponsored: [],
+   605→      results: [],
+   606→      clusters: [],
+   607→      relatedQuestions: [],
+   608→      didYouMean: null,
+   609→      pagination: { page: 1, pageSize: 10, totalResults: 0, totalPages: 1 },
+   610→      personalized: false,
+   611→      personalizationFactors: [],
+   612→      indexStats,
+   613→    }
+   614→  }
+   615→
+   616→  // Build query tokens (with phrase support if exact mode or phrases present)
+   617→  const phraseRequested = mode === 'EXACT' || parsed.phrases.length > 0
+   618→  const queryTokens = removeStopwords(tokenize(
+   619→    (parsed.tokens.join(' ') + ' ' + parsed.phrases.join(' ')).trim()
+   620→  ))
+   621→
+   622→  // Load the index map
+   623→  const allDocsMap = await getAllDocsMap()
+   624→  const allDocs: DocRow[] = Array.from(allDocsMap.values()) as DocRow[]
+   625→
+   626→  // Pre-filter (apply all filters at retrieval time for efficiency)
+   627→  const filteredDocs: DocRow[] = []
+   628→  for (const d of allDocs) {
+   629→    if (!passesFreshnessFilter(d, filters, parsed)) continue
+   630→    if (!passesLanguageFilter(d, filters, parsed)) continue
+   631→    if (!passesCountryFilter(d, filters, parsed)) continue
+   632→    if (!passesSourceTypeFilter(d, mode, filters, parsed)) continue
+   633→    if (!passesSiteFilter(d, parsed)) continue
+   634→    if (!passesFileTypeFilter(d, parsed)) continue
+   635→    if (!passesSafeSearchFilter(d, filters)) continue
+   636→    filteredDocs.push(d)
+   637→  }
+   638→
+   639→  // Query the indexer's TF-IDF engine over the WHOLE index, then intersect
+   640→  // with filtered docs (so we get the proper ranking signal).
+   641→  const hits = await queryIndex(queryTokens, { phrase: phraseRequested })
+   642→  const hitByDocId = new Map(hits.map((h) => [h.docId, h]))
+   643→
+   644→  // --- Semantic query expansion (§5, §2) ---
+   645→  // If the initial BM25 query returned < 10 results AND AI is enabled,
+   646→  // expand the query with LLM-generated synonyms + run a second BM25.
+   647→  // This finds docs that use different words for the same concept —
+   648→  // "semantic" search without embeddings.
+   649→  if (hits.length < 10 && filters.aiMode !== 'OFF') {
+   650→    try {
+   651→      const expanded = await expandQuery(parsed)
+   652→      if (expanded.synonyms && expanded.synonyms.length > 0) {
+   653→        // Add synonyms to the query tokens (stemmed for index matching).
+   654→        const synonymTokens = expanded.synonyms
+   655→          .flatMap((s: string) => tokenize(s))
+   656→          .map((t: string) => stem(t))
+   657→          .filter(Boolean)
+   658→        const expandedTokens = [...new Set([...queryTokens, ...synonymTokens])]
+   659→        if (expandedTokens.length > queryTokens.length) {
+   660→          const expandedHits = await queryIndex(expandedTokens, { phrase: false })
+   661→          // Merge: add only NEW hits (docs not already in hitByDocId).
+   662→          for (const h of expandedHits) {
+   663→            if (!hitByDocId.has(h.docId)) {
+   664→              hitByDocId.set(h.docId, h)
+   665→            }
+   666→          }
+   667→        }
+   668→      }
+   669→    } catch {
+   670→      // expandQuery failure is non-fatal — just use the original hits.
+   671→    }
+   672→  }
+   673→
+   674→  // Build candidate list: only docs that pass filters AND have hits.
+   675→  // (If query produced no hits, we fall back to "did you mean" later.)
+   676→  const candidates = filteredDocs
+   677→    .map((d) => {
+   678→      const h = hitByDocId.get(d.id)
+   679→      if (!h) return null
+   680→      return { doc: d, hit: h }
+   681→    })
+   682→    .filter((x): x is { doc: DocRow; hit: typeof hits[number] } => x !== null)
+   683→
+   684→  // --- Semantic search boost (out-of-box idea) ---
+   685→  // Compute the query embedding + look up the top-N most similar docs by
+   686→  // cosine similarity. Any doc that appears in BOTH the BM25 candidates AND
+   687→  // the semantic top-N gets a relevance boost. This catches the case where
+   688→  // BM25 misses a doc because the query uses different wording (e.g. the
+   689→  // query is "iphone" but the doc says "Apple smartphone" — semantically
+   690→  // close, lexically different).
+   691→  const semanticBoostByDocId = new Map<string, number>()
+   692→  try {
+   693→    const { semanticSearch } = await import('./indexer')
+   694→    const semanticHits = await semanticSearch(query, { limit: 30 })
+   695→    for (const sh of semanticHits) {
+   696→      semanticBoostByDocId.set(sh.docId, sh.semanticScore)
+   697→    }
+   698→  } catch {
+   699→    // semanticSearch unavailable — non-critical, BM25-only ranking proceeds.
+   700→  }
+   701→
+   702→  // Build the dbDocs map expected by rankCandidates
+   703→  const dbDocsForRank = new Map<string, any>()
+   704→  for (const c of candidates) {
+   705→    dbDocsForRank.set(c.doc.id, c.doc)
+   706→  }
+   707→
+   708→  const rankedInputs = candidates.map((c) => ({
+   709→    docId: c.doc.id,
+   710→    tfidf: c.hit.tfidf,
+   711→    matchedTerms: c.hit.matchedTerms,
+   712→    // Out-of-box: semantic boost from cosine similarity (0 if no embedding).
+   713→    semanticBoost: semanticBoostByDocId.get(c.doc.id) ?? 0,
+   714→  }))
+   715→
+   716→  // RESEARCH mode: enlarge candidate pool — already limited by queryIndex
+   717→  // to 200; nothing more to do here.
+   718→
+   719→  // Fetch the link-graph authority map (§7.4) — cached, stale-while-revalidate.
+   720→  // This gives pages with more inbound links a slight ranking boost.
+   721→  const { getAuthorityMap } = await import('./authority')
+   722→  const authorityMap = await getAuthorityMap().catch(() => new Map<string, number>())
+   723→
+   724→  const ranked = await rankCandidates(
+   725→    rankedInputs,
+   726→    query,
+   727→    mode,
+   728→    filters,
+   729→    parsed,
+   730→    dbDocsForRank as any,
+   731→    { authorityMap, lens }
+   732→  )
+   733→
+   734→  // Diversity
+   735→  const maxPerDomain = filters.domainDiversity === 0 ? 0 : filters.domainDiversity
+   736→  const rankedDocIds = ranked.map((r) => r.docId)
+   737→  const divResult = applyDiversity(rankedDocIds, dbDocsForRank as any, maxPerDomain)
+   738→
+   739→  // Build the kept set (for the page slice)
+   740→  const keptIds = new Set(divResult.kept)
+   741→  const finalRanked = ranked.filter((r) => keptIds.has(r.docId))
+   742→
+   743→  // Pagination
+   744→  const pageSize = Math.max(1, Math.min(50, filters.pageSize || 10))
+   745→  const page = Math.max(1, filters.page || 1)
+   746→  const startIdx = (page - 1) * pageSize
+   747→  const endIdx = startIdx + pageSize
+   748→  const pageRanked = finalRanked.slice(startIdx, endIdx)
+   749→
+   750→  // Fetch contentText for ONLY the top-N results (not the whole index) —
+   751→  // this keeps the cold-cache search fast (~1s instead of 15s for loading
+   752→  // all contentText from Turso). The contentText is used for snippet
+   753→  // generation so query terms actually appear in the snippets.
+   754→  const topDocIds = pageRanked.map((r) => r.docId)
+   755→  const contentMap = await fetchContentForSnippets(topDocIds)
+   756→
+   757→  // Build result objects
+   758→  const results: SearchResult[] = pageRanked.map((r) => {
+   759→    const doc = dbDocsForRank.get(r.docId) as DocRow
+   760→    const clusterSize = (divResult.clusters.find((c) => c.primaryId === r.docId)?.size) ?? 1
+   761→    return {
+   762→      id: doc.id,
+   763→      title: doc.title,
+   764→      url: doc.url,
+   765→      domain: doc.domain,
+   766→      snippet: makeSnippet(doc as any, queryTokens, contentMap.get(doc.id)) || doc.snippet,
+   767→      sourceType: doc.sourceType,
+   768→      publishedAt: doc.publishedAt ? doc.publishedAt.toISOString() : null,
+   769→      updatedAt: doc.updatedAt ? doc.updatedAt.toISOString() : null,
+   770→      language: doc.language,
+   771→      country: doc.country,
+   772→      isOriginal: doc.isOriginal,
+   773→      clusterId: doc.clusterId,
+   774→      clusterSize,
+   775→      whyThisResult: r.whySignals,
+   776→      relevanceScore: Math.round(r.relevanceScore * 1000) / 1000,
+   777→      qualityScore: Math.round(doc.qualityScore * 1000) / 1000,
+   778→      author: doc.author,
+   779→      docType: docTypeFromUrl(doc.url),
+   780→      ogImage: doc.ogImage ?? null,
+   781→    }
+   782→  })
+   783→
+   784→  // Clusters (convert to public shape)
+   785→  const clusters: SearchCluster[] = divResult.clusters.map((c) => ({
+   786→    id: c.id,
+   787→    primaryId: c.primaryId,
+   788→    size: c.size,
+   789→    suppressedIds: c.suppressedIds,
+   790→  }))
+   791→
+   792→  // Sponsored ads — match query keywords against SponsoredAd.keywords
+   793→  const sponsored: SearchSponsored[] = []
+   794→  try {
+   795→    const allAds = await db.sponsoredAd.findMany({ where: { active: true } })
+   796→    const queryTokensLower = new Set(queryTokens.map((t) => t.toLowerCase()))
+   797→    for (const ad of allAds) {
+   798→      let keywords: string[] = []
+   799→      try {
+   800→        keywords = JSON.parse(ad.keywords) as string[]
+   801→      } catch {
+   802→        keywords = []
+   803→      }
+   804→      const matched = keywords.some((k) =>
+   805→        queryTokensLower.has(k.toLowerCase()) ||
+   806→        query.toLowerCase().includes(k.toLowerCase())
+   807→      )
+   808→      if (matched) {
+   809→        sponsored.push({
+   810→          id: ad.id,
+   811→          advertiser: ad.advertiser,
+   812→          headline: ad.headline,
+   813→          displayUrl: ad.displayUrl,
+   814→          targetUrl: ad.targetUrl,
+   815→          snippet: ad.snippet,
+   816→          whyAdReason: ad.whyAdReason,
+   817→        })
+   818→      }
+   819→    }
+   820→  } catch {
+   821→    // ignore ad fetch errors
+   822→  }
+   823→
+   824→  // --- Instant answer already handled at the top of search() (fast path).
+   825→  // If we reach here, no tool matched, so instantAnswer is null.
+   826→
+   827→  // --- AI layer is now LAZY — fetched separately via /api/search/ai -------
+   828→  // The main search() returns results + instant answer + sponsored + clusters
+   829→  // immediately. The AI summary, knowledge card, and related questions are
+   830→  // slow (multiple LLM calls, ~15s) — they're fetched by the frontend AFTER
+   831→  // results render, so the user sees results in ~1s and AI streams in after.
+   832→  const aiAnswer: AISearchResult | null = null
+   833→  const knowledgeCard: KnowledgeCard | null = null
+   834→  const relatedQuestions: string[] = []
+   835→
+   836→  // Did you mean? — only suggest a correction when we have NO results AND
+   837→  // a candidate is genuinely close to the query (token overlap OR very low
+   838→  // Levenshtein distance). The previous threshold (dist <= query length)
+   839→  // was too loose — "react hooks" suggested "hacker news" which is
+   840→  // irrelevant. New rule: only suggest if (a) ≥1 query token appears in the
+   841→  // candidate title, OR (b) Levenshtein distance < 40% of query length.
+   842→  let didYouMean: string | null = null
+   843→  if (finalRanked.length === 0 && allDocs.length > 0) {
+   844→    const target = parsed.tokens.join(' ')
+   845→    const queryTokens = new Set(parsed.tokens.map((t) => t.toLowerCase()))
+   846→    if (target.length > 2) {
+   847→      let best: string | null = null
+   848→      let bestScore = -Infinity
+   849→      // Sample 200 docs to keep it fast.
+   850→      const sample = allDocs.slice(0, 200)
+   851→      for (const d of sample) {
+   852→        const candidate = d.title.toLowerCase()
+   853→        if (!candidate || candidate.length < 3) continue
+   854→        // Token overlap — count query tokens that match (exact, prefix, OR
+   855→        // fuzzy). "reactt" → "react" (prefix). "javascrpt" → "javascript"
+   856→        // (fuzzy: dist=1, both ≥5 chars). This catches the common typo
+   857→        // families: extra char, missing char, transposed char, plural.
+   858→        const candidateTokens = candidate.split(/\s+/)
+   859→        let overlap = 0
+   860→        for (const qt of queryTokens) {
+   861→          if (qt.length < 3) continue
+   862→          for (const ct of candidateTokens) {
+   863→            if (ct === qt) { overlap++; break }
+   864→            // Prefix match: one is a prefix of the other (≥4 char prefix).
+   865→            if (qt.length >= 4 && ct.length >= 4 && (ct.startsWith(qt) || qt.startsWith(ct))) {
+   866→              overlap++
+   867→              break
+   868→            }
+   869→            // Fuzzy match: per-token Levenshtein ≤ 2 for tokens ≥ 5 chars.
+   870→            // Catches deletions ("javascrpt"→"javascript"), insertions,
+   871→            // transpositions ("recat"→"react").
+   872→            if (qt.length >= 5 && ct.length >= 5) {
+   873→              const td = levenshtein(qt, ct)
+   874→              if (td <= 2) { overlap++; break }
+   875→            }
+   876→          }
+   877→        }
+   878→        // Levenshtein distance against the full candidate (capped at 60 chars
+   879→        // to avoid quadratic blowup on very long titles). Previously we sliced
+   880→        // from the start which broke matches like "reactt" → "Quick Start – React".
+   881→        const clamped = candidate.slice(0, Math.min(candidate.length, 60))
+   882→        const dist = levenshtein(target, clamped)
+   883→        // Score: token overlap weighted heavily; Levenshtein penalizes.
+   884→        const score = overlap * 1.0 - dist * 0.05
+   885→        if (score > bestScore) {
+   886→          bestScore = score
+   887→          best = candidate
+   888→        }
+   889→      }
+   890→      // Only suggest if there's meaningful token overlap OR a very close
+   891→      // edit distance. Tuning rationale (dist weight = 0.05):
+   892→      //   "react hooks" vs "hacker news": overlap=0, dist~8, score=-0.4 → reject
+   893→      //   "reactt" vs "Quick Start – React": overlap=1 (prefix), score=0.15 → accept
+   894→      //   "nodjs" vs "docs.rs": overlap=0, dist~4, score=-0.2 → reject (borderline)
+   895→      const hasOverlap = bestScore >= 0.1 // ≥1 token overlaps (prefix counts)
+   896→      const veryClose = bestScore >= -0.1 // dist ≤ ~2 chars with no overlap
+   897→      if (best && (hasOverlap || veryClose)) {
+   898→        didYouMean = best
+   899→      }
+   900→    }
+   901→  }
+   902→
+   903→  // Log query (aggregated, anonymized — frequency + a hash of normalized
+   904→  // query, no user identity)
+   905→  try {
+   906→    const normalizedQuery = normalize(query)
+   907→    if (normalizedQuery) {
+   908→      await db.queryLog.upsert({
+   909→        where: { normalized: normalizedQuery },
+   910→        create: { query, normalized: normalizedQuery, frequency: 1 },
+   911→        update: {
+   912→          frequency: { increment: 1 },
+   913→          lastUsedAt: new Date(),
+   914→        },
+   915→      })
+   916→    }
+   917→  } catch {
+   918→    // ignore — query logging is non-critical
+   919→  }
+   920→
+   921→  // --- Instant answer: null here (tools were handled at the top of
+   922→  // search() as a fast path). ---
+   923→  const instantAnswer: InstantAnswer | null = null
+   924→
+   925→  // --- Live web fallback (spec §69 supplementary source) ------------------
+   926→  // P1-1: trigger when index results are weak (count < 3 OR top-3 mean score
+   927→  // < 0.3 OR query coverage < 50%), not just when count === 0. This lets the
+   928→  // engine escape the small local index for celebrity/news queries where the
+   929→  // BM25 query happens to match an irrelevant doc.
+   930→  let liveWebResults: LiveWebResult[] = []
+   931→  const topThree = finalRanked.slice(0, 3)
+   932→  const topMeanScore = topThree.length > 0
+   933→    ? topThree.reduce((s, r) => s + r.relevanceScore, 0) / topThree.length
+   934→    : 0
+   935→  // P1-1 (extended): union of matched terms across top-3 — for coverage check.
+   936→  // We map back from finalRanked.docId → candidates[].hit.matchedTerms.
+   937→  const candidateByDocId = new Map(candidates.map((c) => [c.doc.id, c]))
+   938→  const topMatchedTerms: string[] = []
+   939→  for (const r of topThree) {
+   940→    const c = candidateByDocId.get(r.docId)
+   941→    if (c?.hit?.matchedTerms) {
+   942→      for (const t of c.hit.matchedTerms) {
+   943→        if (!topMatchedTerms.includes(t)) topMatchedTerms.push(t)
+   944→      }
+   945→    }
+   946→  }
+   947→  if (shouldLiveWebFallback(query, finalRanked.length, topMeanScore, topMatchedTerms)) {
+   948→    try {
+   949→      liveWebResults = await runLiveWebSearch(query)
+   950→    } catch {
+   951→      // ignore
+   952→    }
+   953→  }
+   954→
+   955→  // SearchHistory (only if personalization ON and a sessionId exists)
+   956→  const personalized = opts.personalization === 'ON' && !!opts.sessionId
+   957→  if (personalized && opts.sessionId) {
+   958→    try {
+   959→      await db.searchHistory.create({
+   960→        data: {
+   961→          query,
+   962→          mode,
+   963→          filters: JSON.stringify(filters),
+   964→          resultCount: finalRanked.length,
+   965→          sessionId: opts.sessionId,
+   966→        },
+   967→      })
+   968→    } catch {
+   969→      // ignore
+   970→    }
+   971→  }
+   972→
+   973→  // Index stats
+   974→  const indexStats: IndexStats = {
+   975→    documents: allDocs.length,
+   976→    domains: new Set(allDocs.map((d) => d.domain)).size,
+   977→    indexSize: allDocs.reduce((s, d) => s + (d.indexTerms?.length ?? 0), 0),
+   978→    lastCrawl: allDocs.length > 0
+   979→      ? allDocs.reduce((m, d) => (d.crawledAt > m ? d.crawledAt : m), allDocs[0].crawledAt).toISOString()
+   980→      : null,
+   981→  }
+   982→
+   983→  // Personalization factors (only language/region)
+   984→  const personalizationFactors: string[] = []
+   985→  if (filters.language) personalizationFactors.push(`Language: ${filters.language}`)
+   986→  if (filters.country) personalizationFactors.push(`Region: ${filters.country}`)
+   987→  if (filters.sourceTypes && filters.sourceTypes.length > 0) {
+   988→    personalizationFactors.push(`Source types: ${filters.sourceTypes.join(', ')}`)
+   989→  }
+   990→  if (filters.freshness !== 'ANY') {
+   991→    personalizationFactors.push(`Freshness: ${filters.freshness}`)
+   992→  }
+   993→
+   994→  // Interpreted query string for display
+   995→  const interpretedQuery = parsed.tokens.join(' ') + (parsed.phrases.length ? ` (phrase: "${parsed.phrases.join('", "')}")` : '')
+   996→
+   997→  const response: SearchResponse = {
+   998→    query,
+   999→    interpretedQuery,
+  1000→    tookMs: Date.now() - _searchStart, // P2-1
+  1001→    totalFound: finalRanked.length,    // P2-1: total matching docs from index (pre-pagination)
+  1002→    instantAnswer,
+  1003→    liveWebResults,
+  1004→    aiAnswer,
+  1005→    knowledgeCard,
+  1006→    sponsored,
+  1007→    results,
+  1008→    clusters,
+  1009→    relatedQuestions,
+  1010→    didYouMean,
+  1011→    pagination: {
+  1012→      page,
+  1013→      pageSize,
+  1014→      totalResults: finalRanked.length,
+  1015→      totalPages: Math.max(1, Math.ceil(finalRanked.length / pageSize)),
+  1016→    },
+  1017→    personalized,
+  1018→    personalizationFactors,
+  1019→    indexStats,
+  1020→  }
+  1021→
+  1022→  // Cache the response for repeated queries (LRU, 5-min TTL).
+  1023→  setSearchCache(cacheKey, response)
+  1024→
+  1025→  // Tier 2: also cache in Neon (persists across restarts, 5-min TTL).
+  1026→  try {
+  1027→    const { setNeonCache, recordNeonAnalytics } = await import('../neon')
+  1028→    setNeonCache(cacheKey, query, mode, response, 300).catch(() => {})
+  1029→    recordNeonAnalytics({
+  1030→      query, mode, latencyMs: Date.now() - _searchStart,
+  1031→      resultCount: response.results.length, cacheHit: false,
+  1032→      toolUsed: response.instantAnswer?.kind ?? null,
+  1033→    }).catch(() => {})
+  1034→  } catch { /* Neon unavailable — non-critical */ }
+  1035→
+  1036→  // Record metrics for observability (§66).
+  1037→  void recordSearch({
+  1038→    query,
+  1039→    mode,
+  1040→    latencyMs: Date.now() - _searchStart,
+  1041→    resultCount: response.results.length,
+  1042→    cacheHit: false,
+  1043→    toolUsed: response.instantAnswer?.kind ?? null,
+  1044→  })
+  1045→
+  1046→  return response
+  1047→}
+  1048→
+  1049→// --- Lazy AI layer (fetched separately after results render) -------------
+  1050→// The main search() returns results + instant answer + sponsored + clusters
+  1051→// immediately (~1s). The AI summary + knowledge card + related questions
+  1052→// are slow (multiple LLM calls). The frontend calls this function via the
+  1053→// /api/search/ai endpoint AFTER the results render, so the user sees
+  1054→// results instantly and the AI layer streams in after.
+  1055→
+  1056→export interface AILayer {
+  1057→  aiAnswer: AISearchResult | null
+  1058→  knowledgeCard: KnowledgeCard | null
+  1059→  relatedQuestions: string[]
+  1060→}
+  1061→
+  1062→export async function generateAILayer(
+  1063→  query: string,
+  1064→  mode: SearchMode,
+  1065→  filters: SearchFilters,
+  1066→  results: SearchResult[],
+  1067→): Promise<AILayer> {
+  1068→  const parsed = parseQuery(query)
+  1069→  const aiEnabled =
+  1070→    filters.aiMode === 'ON' ||
+  1071→    (filters.aiMode === 'AUTO' &&
+  1072→      ['BALANCED', 'LATEST', 'RESEARCH', 'ACADEMIC', 'NEWS', 'OFFICIAL'].includes(mode))
+  1073→
+  1074→  if (!aiEnabled) {
+  1075→    return { aiAnswer: null, knowledgeCard: null, relatedQuestions: [] }
+  1076→  }
+  1077→
+  1078→  // Run AI summary + knowledge card + related questions in parallel for speed.
+  1079→  const [aiAnswer, knowledgeCard, expanded] = await Promise.all([
+  1080→    results.length > 0
+  1081→      ? generateAISummary(query, parsed, results.slice(0, 8).map((r) => ({
+  1082→          id: r.id, title: r.title, url: r.url, snippet: r.snippet,
+  1083→          sourceType: r.sourceType, domain: r.domain,
+  1084→        }))).catch(() => null)
+  1085→      : Promise.resolve(null),
+  1086→    results.length >= 2
+  1087→      ? generateKnowledgeCard(query, results.slice(0, 6).map((r) => ({
+  1088→          id: r.id, title: r.title, url: r.url, snippet: r.snippet,
+  1089→          sourceType: r.sourceType, domain: r.domain,
+  1090→        }))).catch(() => null)
+  1091→      : Promise.resolve(null),
+  1092→    expandQuery(parsed).catch(() => ({ synonyms: [], relatedQuestions: [] })),
+  1093→  ])
+  1094→
+  1095→  return {
+  1096→    aiAnswer,
+  1097→    knowledgeCard,
+  1098→    relatedQuestions: expanded?.relatedQuestions ?? [],
+  1099→  }
+  1100→}
+  1101→
+  1102→// --- Source profile + stats -----------------------------------------------
+  1103→
+  1104→export async function getSource(id: string): Promise<any | null> {
+  1105→  const doc = await db.document.findUnique({ where: { id } })
+  1106→  if (!doc) return null
+  1107→  // Pull related primary sources by domain (5 most recent non-this docs)
+  1108→  const related = await db.document.findMany({
+  1109→    where: {
+  1110→      domain: doc.domain,
+  1111→      id: { not: doc.id },
+  1112→      sourceType: { in: ['PRIMARY', 'OFFICIAL', 'GOVERNMENT'] },
+  1113→    },
+  1114→    orderBy: { crawledAt: 'desc' },
+  1115→    take: 5,
+  1116→    select: { id: true, title: true, url: true, sourceType: true, crawledAt: true },
+  1117→  })
+  1118→  const documentsInIndex = await db.document.count({ where: { domain: doc.domain } })
+  1119→  return {
+  1120→    id: doc.id,
+  1121→    publisher: doc.publisher,
+  1122→    sourceType: doc.sourceType,
+  1123→    country: doc.country,
+  1124→    language: doc.language,
+  1125→    firstIndexed: doc.createdAt,
+  1126→    lastCrawled: doc.crawledAt,
+  1127→    lastUpdate: doc.updatedAt,
+  1128→    isOriginal: doc.isOriginal,
+  1129→    contentCategories: [doc.sourceType],
+  1130→    relatedPrimarySources: related,
+  1131→    documentsInIndex,
+  1132→    domain: doc.domain,
+  1133→  }
+  1134→}
+  1135→
+  1136→// --- Cached stats (Turso COUNT queries are remote + slow) -----------------
+  1137→// Cache the stats response in-memory. Stats are 5 COUNT queries against the
+  1138→// remote Turso DB — uncached, they take 5-45s. We use a STALE-WHILE-REVALIDATE
+  1139→// pattern: return cached data immediately (even if stale), and refresh in the
+  1140→// background. This means the first-ever request pays the cost, but every
+  1141→// subsequent request (including from /api/search's indexStats field) is instant.
+  1142→let _statsCache: { data: any; expiresAt: number; refreshing: boolean } | null = null
+  1143→const STATS_TTL_MS = 60_000 // fresh for 1 min
+  1144→const STATS_STALE_MS = 5 * 60_000 // serve stale for up to 5 min while refreshing
+  1145→
+  1146→export function invalidateStatsCache() {
+  1147→  _statsCache = null
+  1148→}
+  1149→
+  1150→async function refreshStats(): Promise<any> {
+  1151→  const documents = await db.document.count()
+  1152→  const domains = await db.document.groupBy({
+  1153→    by: ['domain'],
+  1154→    _count: { _all: true },
+  1155→  })
+  1156→  const queueDepth = await db.crawlQueue.count({ where: { status: 'pending' } })
+  1157→  const crawlErrors = await db.crawlQueue.count({ where: { status: 'error' } })
+  1158→  const recent = await db.document.findFirst({
+  1159→    orderBy: { crawledAt: 'desc' },
+  1160→    select: { crawledAt: true },
+  1161→  })
+  1162→  const indexSizeBytes = await db.document.aggregate({
+  1163→    _sum: { wordCount: true },
+  1164→  })
+  1165→  return {
+  1166→    documents,
+  1167→    domains: domains.length,
+  1168→    queueDepth,
+  1169→    lastCrawl: recent?.crawledAt ?? null,
+  1170→    crawlErrors,
+  1171→    indexSize: indexSizeBytes._sum.wordCount ?? 0,
+  1172→  }
+  1173→}
+  1174→
+  1175→export async function getStats(): Promise<any> {
+  1176→  const now = Date.now()
+  1177→  // Fresh cache → return immediately.
+  1178→  if (_statsCache && _statsCache.expiresAt > now) {
+  1179→    return _statsCache.data
+  1180→  }
+  1181→  // Stale cache (within STATS_STALE_MS) → return stale + refresh in background.
+  1182→  if (_statsCache && _statsCache.expiresAt + STATS_STALE_MS > now) {
+  1183→    if (!_statsCache.refreshing) {
+  1184→      _statsCache.refreshing = true
+  1185→      refreshStats()
+  1186→        .then((data) => {
+  1187→          _statsCache = { data, expiresAt: now + STATS_TTL_MS, refreshing: false }
+  1188→        })
+  1189→        .catch(() => {
+  1190→          if (_statsCache) _statsCache.refreshing = false
+  1191→        })
+  1192→    }
+  1193→    return _statsCache.data
+  1194→  }
+  1195→  // No cache (cold start) → block + fetch. This is the slow path that only
+  1196→  // happens once per server restart.
+  1197→  const data = await refreshStats()
+  1198→  _statsCache = { data, expiresAt: now + STATS_TTL_MS, refreshing: false }
+  1199→  return data
+  1200→}
+  1201→
+  1202→/** A fast snapshot for inclusion in search responses — never blocks. Returns
+  1203→ *  cached stats, or a minimal placeholder if the cache is cold. */
+  1204→export function getStatsFast(): any {
+  1205→  if (_statsCache) return _statsCache.data
+  1206→  return {
+  1207→    documents: 0,
+  1208→    domains: 0,
+  1209→    queueDepth: 0,
+  1210→    lastCrawl: null,
+  1211→    crawlErrors: 0,
+  1212→    indexSize: 0,
+  1213→  }
+  1214→}
+  1215→
+  1216→// --- Pre-warm the index + stats cache on server start ---------------------
+  1217→// Called once on server startup to load the index + stats into memory so
+  1218→// the FIRST search is fast (no cold-cache penalty). This runs in the
+  1219→// background — the server starts immediately and pre-warming happens async.
+  1220→let _prewarmed = false
+  1221→export async function prewarmIndex(): Promise<void> {
+  1222→  if (_prewarmed) return
+  1223→  _prewarmed = true
+  1224→  try {
+  1225→    // Load the document index into the in-memory cache.
+  1226→    const { getAllDocsMap, invalidateIndexCache } = await import('./indexer')
+  1227→    invalidateIndexCache()
+  1228→    await getAllDocsMap()
+  1229→    // Pre-warm the stats cache (stale-while-revalidate pattern).
+  1230→    await getStats()
+  1231→    console.log('[prewarm] index + stats cache warmed')
+  1232→  } catch (e: any) {
+  1233→    console.error('[prewarm] failed:', e?.message ?? e)
+  1234→  }
+  1235→}
+  1236→

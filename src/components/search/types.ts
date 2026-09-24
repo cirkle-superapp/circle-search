@@ -19,6 +19,104 @@ export type SearchMode =
   | 'NEWS'
   | 'IMAGES'
 
+/**
+ * Search Lenses — algorithmic perspective-shifting. Each lens re-weights
+ * the ranking signals to surface a specific perspective. The standout
+ * creative lens is DEVILS_ADVOCATE — it INVERTS the lexical match signal
+ * so docs that don't match as strongly surface FIRST (deliberately
+ * surfaces contrarian / dissenting / tangential views).
+ *
+ * This mirrors `SearchLens` from `src/lib/search/ranking.ts` (server-side)
+ * — redefined here so client bundles never import the server ranking lib.
+ */
+export type SearchLens =
+  | 'BALANCED'
+  | 'ACADEMIC'
+  | 'NEWS'
+  | 'PRIMARY'
+  | 'COMMUNITY'
+  | 'COMMERCIAL'
+  | 'DEVILS_ADVOCATE'
+
+/**
+ * Lens metadata for the UI. Mirrors LENS_METADATA in
+ * `src/lib/search/ranking.ts`. The `icon` field is a lucide-react icon
+ * name (lowercased, kebab-cased) — the UI maps it to the actual icon
+ * component.
+ */
+export interface LensMeta {
+  label: string
+  /** lucide-react icon name (kebab-case). */
+  icon: string
+  /** Tailwind text color token (e.g. 'text-rose'). */
+  color: string
+  /** Tailwind bg color token (e.g. 'bg-rose') — used for the active pill. */
+  bg: string
+  /** Tailwind border/ring color token. */
+  ring: string
+  description: string
+}
+
+export const LENS_METADATA: Record<SearchLens, LensMeta> = {
+  BALANCED: {
+    label: 'Balanced',
+    icon: 'scale',
+    color: 'text-foreground',
+    bg: 'bg-foreground/10',
+    ring: 'ring-foreground/30',
+    description: 'Default mode-weighted ranking. No perspective bias.',
+  },
+  ACADEMIC: {
+    label: 'Academic',
+    icon: 'graduation-cap',
+    color: 'text-teal',
+    bg: 'bg-teal/15',
+    ring: 'ring-teal/40',
+    description: 'Boosts peer-reviewed + official sources. Surfaces primary research.',
+  },
+  NEWS: {
+    label: 'News',
+    icon: 'newspaper',
+    color: 'text-rose',
+    bg: 'bg-rose/15',
+    ring: 'ring-rose/40',
+    description: 'Boosts recency + news sources. Best for current events.',
+  },
+  PRIMARY: {
+    label: 'Primary',
+    icon: 'file-text',
+    color: 'text-gold',
+    bg: 'bg-gold/15',
+    ring: 'ring-gold/40',
+    description: 'Boosts first-hand accounts + primary sources. Direct evidence.',
+  },
+  COMMUNITY: {
+    label: 'Community',
+    icon: 'users',
+    color: 'text-steel',
+    bg: 'bg-steel/15',
+    ring: 'ring-steel/40',
+    description: 'Boosts forums, discussions, Q&A sites. Lived experience.',
+  },
+  COMMERCIAL: {
+    label: 'Commercial',
+    icon: 'shopping-bag',
+    color: 'text-gold',
+    bg: 'bg-gold/15',
+    ring: 'ring-gold/40',
+    description: 'Boosts product pages + commercial sources. Buyer intent.',
+  },
+  DEVILS_ADVOCATE: {
+    label: "Devil's Advocate",
+    icon: 'flame',
+    color: 'text-rose',
+    bg: 'bg-rose/20',
+    ring: 'ring-rose/50',
+    description:
+      'INVERTS the ranking to surface dissenting, contrarian, and tangential views. For controversial queries, this surfaces the perspectives the standard ranking would bury.',
+  },
+}
+
 export type SourceType =
   | 'OFFICIAL'
   | 'GOVERNMENT'
@@ -189,9 +287,29 @@ export interface LiveWebResult {
   sourceType: string
 }
 
+/**
+ * Structured query-introspection object — emitted by the server alongside
+ * the `interpretedQuery` string. Used by the QueryDna card to show the
+ * user's query as tokens / intent / entities / languages / countries.
+ *
+ * Optional: the server may omit it (older builds). The QueryDna card
+ * gracefully degrades by deriving tokens from the raw query string.
+ */
+export interface ParsedQuerySummary {
+  tokens: string[]
+  phrases: string[]
+  exclusions: string[]
+  intent: string
+  entities: { text: string; type: string }[]
+  languages: string[]
+  countries: string[]
+}
+
 export interface SearchResponse {
   query: string
   interpretedQuery: string
+  /** Structured query introspection (optional — older server builds omit). */
+  parsed?: ParsedQuerySummary
   instantAnswer: InstantAnswer | null
   liveWebResults: LiveWebResult[]
   aiAnswer: AiAnswer | null

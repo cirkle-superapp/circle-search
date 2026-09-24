@@ -31,6 +31,7 @@ import { SearchBox } from './SearchBox'
 import { ModeTabs } from './ModeTabs'
 import { ThemeToggle } from './ThemeToggle'
 import { CommandPalette } from './CommandPalette'
+import { TrendingTicker } from './TrendingTicker'
 import { TrendingSearches } from './TrendingSearches'
 import { Footer } from './Footer'
 import { PWARegister } from '@/components/PWARegister'
@@ -251,6 +252,13 @@ export function SearchHome() {
         >
           <ModeTabs variant="home" />
         </motion.div>
+
+        {/* Trending ticker — auto-scrolling marquee of the most-frequent
+            queries, with a Surprise Me button that picks a random one.
+            Rendered ABOVE the TrendingSearches grid so the home page
+            feels alive + gives the user a one-click path to a trending
+            query without scrolling. */}
+        <TrendingTicker className="mt-4" />
 
         {/* Trending searches — most-frequent queries from the index */}
         <TrendingSearches className="mt-4" />

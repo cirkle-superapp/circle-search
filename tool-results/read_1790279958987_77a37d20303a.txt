@@ -1,0 +1,728 @@
+     1→/**
+     2→ * SearchResults.tsx
+     3→ * -----------------------------------------------------------------------------
+     4→ * The main SERP (Search Engine Results Page). Renders:
+     5→ *
+     6→ *   - <SearchHeader> (sticky, white/blur backdrop)
+     7→ *   - <InterpretedQuery> (if interpretedQuery present)
+     8→ *   - Sponsored section: clearly labeled "Sponsored" header, then
+     9→ *     <SponsoredCard> list (max 3). Amber divider above + below.
+    10→ *   - "About N results (M seconds)" line.
+    11→ *   - "Did you mean …?" suggestion (if present) as a clickable link.
+    12→ *   - <AIAnswer> (if present)
+    13→ *   - Results list: <ResultCard> for each result, with <Separator> between.
+    14→ *   - Cluster expansion: if `clusters` has clusters with size > 1, render a
+    15→ *     "Related results (cluster)" section after the primary results.
+    16→ *   - <RelatedQuestions> (if relatedQuestions.length > 0)
+    17→ *   - <Pagination>
+    18→ *   - <Footer>
+    19→ *
+    20→ * Loading state: 5 <Skeleton> cards mimicking ResultCard shape.
+    21→ * Empty state (0 results): friendly card with "Crawl more sources" button.
+    22→ * Error state: red-tinted alert with the error message + retry button.
+    23→ *
+    24→ * Mounted on the `/` route (orchestrator wires the ?q= param). The store
+    25→ * hydrates from URL on mount, then executes the search.
+    26→ */
+    27→
+    28→'use client'
+    29→
+    30→import * as React from 'react'
+    31→import {
+    32→  AlertCircle,
+    33→  Search as SearchIcon,
+    34→  Sparkles,
+    35→  RefreshCw,
+    36→  Database,
+    37→  Clock,
+    38→  Loader2,
+    39→} from 'lucide-react'
+    40→import {
+    41→  motion,
+    42→  useMotionValue,
+    43→  useSpring,
+    44→  animate,
+    45→  useReducedMotion as useFramerReducedMotion,
+    46→  type Variants,
+    47→} from 'framer-motion'
+    48→import { Button } from '@/components/ui/button'
+    49→import { Skeleton } from '@/components/ui/skeleton'
+    50→import { Separator } from '@/components/ui/separator'
+    51→import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+    52→import { useToast } from '@/hooks/use-toast'
+    53→import { useSearchStore } from '@/store/search-store'
+    54→import { useKeyboardShortcuts } from '@/hooks/use-keyboard-shortcuts'
+    55→import { cn } from '@/lib/utils'
+    56→import { SearchHeader } from './SearchHeader'
+    57→import { SearchPipeline } from './SearchPipeline'
+    58→import { CommandPalette } from './CommandPalette'
+    59→import { InterpretedQuery } from './InterpretedQuery'
+    60→import { AIAnswer } from './AIAnswer'
+    61→import { KnowledgeCard } from './KnowledgeCard'
+    62→import { KnowledgeSidebar } from './KnowledgeSidebar'
+    63→import { SponsoredCard } from './SponsoredCard'
+    64→import { InstantAnswerCard } from './InstantAnswerCard'
+    65→import { ResultCard } from './ResultCard'
+    66→import { ImageGrid } from './ImageGrid'
+    67→import { PageSummaryDialog } from './PageSummaryDialog'
+    68→import { RelatedQuestions } from './RelatedQuestions'
+    69→import { Pagination } from './Pagination'
+    70→import { Footer } from './Footer'
+    71→import { PWARegister } from '@/components/PWARegister'
+    72→import { formatCount, formatRelativeTime } from './format'
+    73→
+    74→export function SearchResults() {
+    75→  const results = useSearchStore((s) => s.results)
+    76→  const loading = useSearchStore((s) => s.loading)
+    77→  const mode = useSearchStore((s) => s.mode)
+    78→  const aiLayerLoading = useSearchStore((s) => s.aiLayerLoading)
+    79→  const error = useSearchStore((s) => s.error)
+    80→  const query = useSearchStore((s) => s.query)
+    81→  const setQuery = useSearchStore((s) => s.setQuery)
+    82→  const setFilters = useSearchStore((s) => s.setFilters)
+    83→  const executeSearch = useSearchStore((s) => s.executeSearch)
+    84→  const triggerSeedCrawl = useSearchStore((s) => s.triggerSeedCrawl)
+    85→  const loadStats = useSearchStore((s) => s.loadStats)
+    86→  const hydrateFromUrl = useSearchStore((s) => s.hydrateFromUrl)
+    87→  const { toast } = useToast()
+    88→
+    89→  // Hydrate from URL on mount (idempotent — safe if the orchestrator's
+    90→  // page.tsx also calls it).
+    91→  React.useEffect(() => {
+    92→    void hydrateFromUrl()
+    93→  }, [hydrateFromUrl])
+    94→
+    95→  // Track the time the search started so we can show "(M seconds)".
+    96→  const [startedAt, setStartedAt] = React.useState<number | null>(null)
+    97→  const [elapsed, setElapsed] = React.useState<number | null>(null)
+    98→  const [summaryDocId, setSummaryDocId] = React.useState<string | null>(null)
+    99→  const [summaryResult, setSummaryResult] = React.useState<{ title: string; url: string; sourceType: string } | null>(null)
+   100→
+   101→  React.useEffect(() => {
+   102→    if (loading) setStartedAt(performance.now())
+   103→  }, [loading])
+   104→
+   105→  React.useEffect(() => {
+   106→    if (!loading && startedAt) {
+   107→      setElapsed((performance.now() - startedAt) / 1000)
+   108→      setStartedAt(null)
+   109→    }
+   110→  }, [loading, startedAt])
+   111→
+   112→  const onPageChange = React.useCallback(
+   113→    (p: number) => {
+   114→      setFilters({ page: p })
+   115→      void executeSearch()
+   116→      // Scroll back to the top of the SERP after a page change.
+   117→      if (typeof window !== 'undefined') {
+   118→        window.scrollTo({ top: 0, behavior: 'smooth' })
+   119→      }
+   120→    },
+   121→    [setFilters, executeSearch],
+   122→  )
+   123→
+   124→  const onSelectRelatedQuestion = React.useCallback(
+   125→    (q: string) => {
+   126→      setQuery(q)
+   127→      setFilters({ page: 1 })
+   128→      void executeSearch()
+   129→      if (typeof window !== 'undefined') {
+   130→        window.scrollTo({ top: 0, behavior: 'smooth' })
+   131→      }
+   132→    },
+   133→    [setQuery, setFilters, executeSearch],
+   134→  )
+   135→
+   136→  const onDidYouMean = React.useCallback(
+   137→    (s: string) => {
+   138→      setQuery(s)
+   139→      setFilters({ page: 1 })
+   140→      void executeSearch()
+   141→    },
+   142→    [setQuery, setFilters, executeSearch],
+   143→  )
+   144→
+   145→  const onSeedCrawl = React.useCallback(async () => {
+   146→    try {
+   147→      const res = await triggerSeedCrawl()
+   148→      if (res) {
+   149→        toast({
+   150→          title: 'Seed crawl complete',
+   151→          description: `Queued ${res.queued} · Crawled ${res.crawled} · Indexed ${res.indexed}${res.errors.length ? ` · ${res.errors.length} errors` : ''}`,
+   152→        })
+   153→        await loadStats()
+   154→        // Re-run the user's search after the crawl.
+   155→        void executeSearch()
+   156→      }
+   157→    } catch (e: any) {
+   158→      toast({
+   159→        title: 'Crawl failed',
+   160→        description: e?.message ?? 'Unknown error',
+   161→        // @ts-ignore — toaster supports variant
+   162→        variant: 'destructive',
+   163→      })
+   164→    }
+   165→  }, [triggerSeedCrawl, loadStats, executeSearch, toast])
+   166→
+   167→  // Global keyboard shortcuts: "/" or Cmd/Ctrl+K focuses the header search
+   168→  // box, Esc blurs it (so arrow keys can scroll the results).
+   169→  useKeyboardShortcuts({
+   170→    onFocusSearch: () => {
+   171→      const el = document.getElementById('cirkle-search-header') as HTMLInputElement | null
+   172→      el?.focus()
+   173→      el?.select()
+   174→    },
+   175→    onEscape: () => {
+   176→      const el = document.activeElement as HTMLInputElement | null
+   177→      if (el && el.tagName === 'INPUT') el.blur()
+   178→    },
+   179→    onTogglePalette: () => {
+   180→      useSearchStore.getState().toggleCommandPalette()
+   181→    },
+   182→  })
+   183→
+   184→  return (
+   185→    <div className="min-h-screen flex flex-col bg-background">
+   186→      <SearchHeader />
+   187→
+   188→      <main
+   189→        id="cirkle-search-results"
+   190→        role="region"
+   191→        aria-label="Search results"
+   192→        aria-busy={loading}
+   193→        className="mx-auto w-full max-w-6xl flex-1 px-4 py-4 sm:px-6 lg:px-8"
+   194→      >
+   195→        {/* Interpreted query (small horizontal panel under the header) */}
+   196→        {results?.interpretedQuery && (
+   197→          <InterpretedQuery
+   198→            interpreted={results.interpretedQuery}
+   199→            personalizationFactors={results.personalizationFactors}
+   200→            className="mb-4"
+   201→          />
+   202→        )}
+   203→
+   204→        {/* Instant answer — real-time tool results (weather / time / math).
+   205→            Shown at the TOP of the SERP, above everything else. These answer
+   206→            instantly (1-2s) via direct API calls — no index lookup, no AI. */}
+   207→        {results?.instantAnswer && (
+   208→          <div className="mb-4">
+   209→            <InstantAnswerCard answer={results.instantAnswer} />
+   210→          </div>
+   211→        )}
+   212→
+   213→        {/* Live web fallback — when the local index returned 0 results, we
+   214→            fetch fresh web results via the web_search SDK (spec §69
+   215→            supplementary source). Clearly labeled, not mixed with organic. */}
+   216→        {results?.liveWebResults && results.liveWebResults.length > 0 && (
+   217→          <section aria-label="Live web results" className="mb-4">
+   218→            <div className="mb-2 flex items-center gap-2">
+   219→              <Separator className="flex-1 bg-teal/40" />
+   220→              <span className="text-[10px] font-bold uppercase tracking-widest text-teal">
+   221→                Live web — outside the CIRKLE index
+   222→              </span>
+   223→              <Separator className="flex-1 bg-teal/40" />
+   224→            </div>
+   225→            <ul className="space-y-2">
+   226→              {results.liveWebResults.slice(0, 5).map((r, i) => (
+   227→                <li key={i} className="rounded-lg border border-border/60 p-3 hover:bg-surface/40">
+   228→                  <a href={r.url} target="_blank" rel="noopener noreferrer" className="font-medium text-foreground hover:text-primary hover:underline">
+   229→                    {r.title}
+   230→                  </a>
+   231→                  <p className="mt-0.5 text-xs text-muted-foreground">{r.domain}</p>
+   232→                  <p className="mt-1 text-sm text-foreground/80">{r.snippet}</p>
+   233→                </li>
+   234→              ))}
+   235→            </ul>
+   236→          </section>
+   237→        )}
+   238→
+   239→        {/* Sponsored section */}
+   240→        {results?.sponsored && results.sponsored.length > 0 && (
+   241→          <section
+   242→            aria-label="Sponsored results"
+   243→            className="mb-4"
+   244→          >
+   245→            <div className="flex items-center gap-2">
+   246→              <Separator className="flex-1 bg-amber-300/60" />
+   247→              <span className="text-[10px] font-bold uppercase tracking-widest text-amber-700">
+   248→                Sponsored
+   249→              </span>
+   250→              <Separator className="flex-1 bg-amber-300/60" />
+   251→            </div>
+   252→            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+   253→              {results.sponsored.slice(0, 3).map((ad) => (
+   254→                <SponsoredCard key={ad.id} ad={ad} />
+   255→              ))}
+   256→            </div>
+   257→            <div className="mt-3 flex items-center gap-2">
+   258→              <Separator className="flex-1 bg-amber-300/60" />
+   259→              <span className="text-[10px] text-muted-foreground">
+   260→                End of sponsored results
+   261→              </span>
+   262→              <Separator className="flex-1 bg-amber-300/60" />
+   263→            </div>
+   264→          </section>
+   265→        )}
+   266→
+   267→        {/* Search pipeline indicator — shows the engine's real stages */}
+   268→        {(loading || (results && !error)) && (
+   269→          <div className="mb-3">
+   270→            <SearchPipeline
+   271→              loading={loading}
+   272→              hasResults={!!results && results.results.length > 0}
+   273→              aiUsed={!!results?.aiAnswer}
+   274→            />
+   275→          </div>
+   276→        )}
+   277→
+   278→        {/* Result count + timing. The count + seconds animate (count-up
+   279→            from 0) so the SERP feels alive + responsive instead of just
+   280→            snapping in. */}
+   281→        {results && !loading && !error && (
+   282→          <div className="mb-3 flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+   283→            <span>
+   284→              About{' '}
+   285→              <span className="font-medium text-foreground">
+   286→                <CountUp value={results.pagination.totalResults} />
+   287→              </span>{' '}
+   288→              results
+   289→              {elapsed != null && (
+   290→                <span className="ml-1 text-xs">
+   291→                  (<CountUp
+   292→                    value={elapsed}
+   293→                    duration={0.7}
+   294→                    format={(n) => n.toFixed(2)}
+   295→                  />{' '}
+   296→                  seconds)
+   297→                </span>
+   298→              )}
+   299→            </span>
+   300→            {results.personalized && (
+   301→              <span className="inline-flex items-center gap-1 text-xs text-primary">
+   302→                <Sparkles className="size-3" aria-hidden />
+   303→                Personalized
+   304→              </span>
+   305→            )}
+   306→            {results.indexStats && results.indexStats.lastCrawl && (
+   307→              <span className="inline-flex items-center gap-1 text-xs">
+   308→                <Clock className="size-3" aria-hidden />
+   309→                Index updated {formatRelativeTime(results.indexStats.lastCrawl)}
+   310→              </span>
+   311→            )}
+   312→          </div>
+   313→        )}
+   314→
+   315→        {/* Did you mean? */}
+   316→        {results?.didYouMean && !loading && (
+   317→          <p className="mb-3 text-sm">
+   318→            <span className="text-muted-foreground">Did you mean </span>
+   319→            <button
+   320→              type="button"
+   321→              onClick={() => onDidYouMean(results.didYouMean!)}
+   322→              className="font-medium text-primary underline underline-offset-2 hover:text-primary"
+   323→            >
+   324→              {results.didYouMean}
+   325→            </button>
+   326→            <span className="text-muted-foreground">?</span>
+   327→          </p>
+   328→        )}
+   329→
+   330→        {/* AI answer — renders immediately when ready, or shows a loading
+   331→            skeleton while the lazy AI layer generates (so the user knows AI
+   332→            is coming, not broken). */}
+   333→        {results?.aiAnswer && !loading && (
+   334→          <div className="mb-4">
+   335→            <AIAnswer aiAnswer={results.aiAnswer} />
+   336→          </div>
+   337→        )}
+   338→        {/* AI Overview loading state — shimmer lines inside a glass card
+   339→            that visually matches the final AI Overview (so the layout
+   340→            doesn't shift when the answer arrives). Uses the same gold
+   341→            left accent + shadow-glass as the real card. */}
+   342→        {!loading && !results?.aiAnswer && aiLayerLoading && (
+   343→          <div
+   344→            className="glass mb-4 overflow-hidden rounded-xl border-l-2 border-l-gold p-4 shadow-glass"
+   345→            role="status"
+   346→            aria-live="polite"
+   347→            aria-label="Generating AI overview"
+   348→          >
+   349→            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+   350→              <Loader2 className="size-4 animate-spin text-gold" aria-hidden />
+   351→              <span>Synthesizing evidence-grounded AI answer…</span>
+   352→            </div>
+   353→            <div className="mt-3 space-y-2">
+   354→              <ShimmerBar className="h-3.5 w-full" />
+   355→              <ShimmerBar className="h-3.5 w-[88%]" />
+   356→              <ShimmerBar className="h-3.5 w-[68%]" />
+   357→            </div>
+   358→          </div>
+   359→        )}
+   360→
+   361→        {/* Loading state — 5 skeleton cards with a shimmer sweep overlay.
+   362→            Mirrors the ResultCard layout (favicon + domain + title + URL +
+   363→            two snippet lines + metadata badges) so the layout doesn't shift
+   364→            when real results arrive. role=status + aria-busy on <main>
+   365→            above already tells AT users what's happening. */}
+   366→        {loading && (
+   367→          <div
+   368→            className="space-y-1"
+   369→            role="status"
+   370→            aria-label="Loading search results"
+   371→          >
+   372→            {Array.from({ length: 5 }).map((_, i) => (
+   373→              <ResultCardSkeleton key={i} />
+   374→            ))}
+   375→          </div>
+   376→        )}
+   377→
+   378→        {/* Error state */}
+   379→        {error && !loading && (
+   380→          <Card className="border-rose bg-rose">
+   381→            <CardHeader className="pb-2">
+   382→              <CardTitle className="flex items-center gap-2 text-sm text-rose">
+   383→                <AlertCircle className="size-4" aria-hidden />
+   384→                Search failed
+   385→              </CardTitle>
+   386→            </CardHeader>
+   387→            <CardContent className="text-sm text-rose">
+   388→              <p>{error}</p>
+   389→              <Button
+   390→                variant="outline"
+   391→                size="sm"
+   392→                className="mt-2 border-rose text-rose hover:bg-rose"
+   393→                onClick={() => void executeSearch()}
+   394→              >
+   395→                <RefreshCw className="size-3.5" aria-hidden />
+   396→                Retry search
+   397→              </Button>
+   398→            </CardContent>
+   399→          </Card>
+   400→        )}
+   401→
+   402→        {/* Empty state */}
+   403→        {!loading && !error && results && results.results.length === 0 && (
+   404→          <Card className="border-primary/30 bg-primary/10">
+   405→            <CardHeader className="pb-2">
+   406→              <CardTitle className="flex items-center gap-2 text-sm text-primary">
+   407→                <SearchIcon className="size-4" aria-hidden />
+   408→                No results found for “{query}”
+   409→              </CardTitle>
+   410→            </CardHeader>
+   411→            <CardContent className="text-sm text-foreground/90">
+   412→              <p>
+   413→                CIRKLE's index might not cover this topic yet. Try different
+   414→                keywords, change filters, or crawl more sources to grow the
+   415→                index.
+   416→              </p>
+   417→              <Button
+   418→                size="sm"
+   419→                className="mt-3 bg-primary text-primary-foreground text-white hover:bg-primary/90"
+   420→                onClick={onSeedCrawl}
+   421→              >
+   422→                <Database className="size-3.5" aria-hidden />
+   423→                Crawl more sources
+   424→              </Button>
+   425→            </CardContent>
+   426→          </Card>
+   427→        )}
+   428→
+   429→        {/* Organic results list + Knowledge Sidebar (desktop) / inline
+   430→            Knowledge Card (mobile). IMAGES mode renders an image grid
+   431→            instead of text cards. */}
+   432→        {!loading && !error && results && results.results.length > 0 && mode === 'IMAGES' && (
+   433→          <div>
+   434→            <ImageGrid results={results.results} />
+   435→          </div>
+   436→        )}
+   437→        {/* Normal text results (all non-IMAGES modes). Staggered entrance:
+   438→            each card springs in from y:12 with a 50ms stagger (capped at
+   439→            ~10 cards so long lists don't drag). whileHover lifts the card
+   440→            by 2px without breaking the existing border-l-2 hover effect
+   441→            (that's on the inner <article>, this is the outer wrapper). */}
+   442→        {!loading && !error && results && results.results.length > 0 && mode !== 'IMAGES' && (
+   443→          <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px] xl:grid-cols-[minmax(0,1fr)_360px]">
+   444→            {/* Mobile-only inline knowledge card at the top of the results.
+   445→                Hidden at lg+ where the sidebar takes over. */}
+   446→            {results.knowledgeCard && (
+   447→              <div className="mb-2 lg:hidden">
+   448→                <KnowledgeCard card={results.knowledgeCard} />
+   449→              </div>
+   450→            )}
+   451→            <motion.section
+   452→              aria-label="Organic results"
+   453→              className="min-w-0 space-y-0"
+   454→              variants={RESULTS_CONTAINER_VARIANTS}
+   455→              initial="hidden"
+   456→              animate="show"
+   457→            >
+   458→              {results.results.map((r, i) => (
+   459→                <React.Fragment key={r.id}>
+   460→                  {i > 0 && <Separator className="my-0" />}
+   461→                  <motion.div
+   462→                    variants={RESULT_ITEM_VARIANTS}
+   463→                    whileHover={{ y: -2, transition: { duration: 0.2 } }}
+   464→                  >
+   465→                    <ResultCard
+   466→                      result={r}
+   467→                      rank={i + 1 + (results.pagination.page - 1) * results.pagination.pageSize}
+   468→                      onSummary={(docId) => {
+   469→                        setSummaryDocId(docId)
+   470→                        setSummaryResult({ title: r.title, url: r.url, sourceType: r.sourceType })
+   471→                      }}
+   472→                    />
+   473→                  </motion.div>
+   474→                </React.Fragment>
+   475→              ))}
+   476→            </motion.section>
+   477→            {/* Desktop-only sticky knowledge sidebar. */}
+   478→            {results.knowledgeCard && (
+   479→              <aside
+   480→                aria-label="Knowledge sidebar"
+   481→                className="hidden lg:block"
+   482→              >
+   483→                <KnowledgeSidebar card={results.knowledgeCard} />
+   484→              </aside>
+   485→            )}
+   486→          </div>
+   487→        )}
+   488→
+   489→        {/* Mobile: knowledge card above organic results when no results yet (e.g., 0 results but entity detected) */}
+   490→        {!loading &&
+   491→          !error &&
+   492→          results &&
+   493→          results.results.length === 0 &&
+   494→          results.knowledgeCard && (
+   495→            <div className="mb-4">
+   496→              <KnowledgeCard card={results.knowledgeCard} />
+   497→            </div>
+   498→          )}
+   499→
+   500→        {/* Cluster expansion */}
+   501→        {!loading &&
+   502→          !error &&
+   503→          results &&
+   504→          results.clusters &&
+   505→          results.clusters.filter((c) => c.size > 1).length > 0 && (
+   506→            <section
+   507→              aria-label="Related results (cluster)"
+   508→              className="mt-8"
+   509→            >
+   510→              <h2 className="mb-2 text-sm font-medium text-muted-foreground">
+   511→                Related results — collapsed by domain diversity
+   512→              </h2>
+   513→              <ul className="space-y-1 text-xs text-muted-foreground">
+   514→                {results.clusters
+   515→                  .filter((c) => c.size > 1)
+   516→                  .map((c) => (
+   517→                    <li
+   518→                      key={c.id}
+   519→                      className="rounded-md border border-border bg-muted/30 px-2 py-1.5"
+   520→                    >
+   521→                      Cluster{' '}
+   522→                      <span className="font-mono">{c.id.slice(0, 12)}</span>{' '}
+   523→                      · {c.size} near-duplicate
+   524→                      {c.size === 1 ? '' : 's'} suppressed.
+   525→                    </li>
+   526→                  ))}
+   527→              </ul>
+   528→            </section>
+   529→          )}
+   530→
+   531→        {/* Related questions */}
+   532→        {!loading && !error && results && results.relatedQuestions.length > 0 && (
+   533→          <RelatedQuestions
+   534→            questions={results.relatedQuestions}
+   535→            onSelect={onSelectRelatedQuestion}
+   536→          />
+   537→        )}
+   538→
+   539→        {/* Pagination */}
+   540→        {!loading && !error && results && results.results.length > 0 && (
+   541→          <Pagination
+   542→            pagination={results.pagination}
+   543→            onPageChange={onPageChange}
+   544→          />
+   545→        )}
+   546→      </main>
+   547→
+   548→      {/* Command palette overlay (toggled via Cmd/Ctrl+K) */}
+   549→      <CommandPalette />
+   550→
+   551→      {/* Page summary dialog — the "advanced browser" feature */}
+   552→      {summaryResult && (
+   553→        <PageSummaryDialog
+   554→          docId={summaryDocId}
+   555→          resultTitle={summaryResult.title}
+   556→          resultUrl={summaryResult.url}
+   557→          resultSourceType={summaryResult.sourceType}
+   558→          onClose={() => { setSummaryDocId(null); setSummaryResult(null) }}
+   559→        />
+   560→      )}
+   561→
+   562→      <Footer />
+   563→
+   564→      {/* PWA service worker registration (renders nothing — side-effect only) */}
+   565→      <PWARegister />
+   566→    </div>
+   567→  )
+   568→}
+   569→
+   570→/**
+   571→ * Loading skeleton for a single ResultCard. Uses the shadcn <Skeleton> base
+   572→ * (rounded-md + animate-pulse) PLUS a moving `.shimmer-overlay` highlight
+   573→ * sweep on top — gives a premium "data is loading" feel rather than a static
+   574→ * grey block. The aria-hidden + role=status wrapper makes it polite to screen
+   575→ * readers.
+   576→ *
+   577→ * Layout mirrors ResultCard: favicon(16px) + domain(14px) on top, full-width
+   578→ * title (20px), URL (14px), then two snippet lines (14px @ 90% + 70%).
+   579→ */
+   580→function ResultCardSkeleton() {
+   581→  return (
+   582→    <div className="py-4" aria-hidden="true">
+   583→      {/* Favicon + domain */}
+   584→      <div className="relative flex items-center gap-2">
+   585→        <ShimmerBar className="size-4 rounded-sm" />
+   586→        <ShimmerBar className="h-3.5 w-40" />
+   587→      </div>
+   588→      {/* Title */}
+   589→      <ShimmerBar className="mt-2 h-5 w-3/4" />
+   590→      {/* URL breadcrumb */}
+   591→      <ShimmerBar className="mt-1 h-3 w-1/2" />
+   592→      {/* Snippet line 1 (90% width) */}
+   593→      <ShimmerBar className="mt-2 h-3.5 w-[90%]" />
+   594→      {/* Snippet line 2 (70% width) */}
+   595→      <ShimmerBar className="mt-1 h-3.5 w-[70%]" />
+   596→      {/* Metadata badges */}
+   597→      <div className="mt-2 flex gap-2">
+   598→        <ShimmerBar className="h-4 w-14" />
+   599→        <ShimmerBar className="h-4 w-16" />
+   600→        <ShimmerBar className="h-4 w-12" />
+   601→      </div>
+   602→    </div>
+   603→  )
+   604→}
+   605→
+   606→/**
+   607→ * A single shimmer bar: the shadcn <Skeleton> base + an absolutely-positioned
+   608→ * `.shimmer-overlay` sweep on top. The parent <Skeleton> is `relative` so
+   609→ * the overlay aligns to the bar's rounded corners.
+   610→ *
+   611→ * Reduced-motion users see no sweep (the `.shimmer-overlay` class hides via
+   612→ * display:none under `prefers-reduced-motion: reduce`).
+   613→ */
+   614→function ShimmerBar({ className }: { className?: string }) {
+   615→  return (
+   616→    <Skeleton className={cn('relative overflow-hidden', className)}>
+   617→      <span className="shimmer-overlay" />
+   618→    </Skeleton>
+   619→  )
+   620→}
+   621→
+   622→/**
+   623→ * Count-up display: animates a number from 0 → N over 800ms using Framer
+   624→ * Motion's `animate()` (spring physics for a satisfying deceleration).
+   625→ * Re-runs whenever `value` changes (e.g. when a new search returns).
+   626→ *
+   627→ * Used for "About N results" so the number ticks up rather than appearing
+   628→ * instantly — feels faster + more alive than a hard swap.
+   629→ */
+   630→function CountUp({
+   631→  value,
+   632→  duration = 0.8,
+   633→  format = (n: number) => formatCount(Math.round(n)),
+   634→  className,
+   635→}: {
+   636→  value: number
+   637→  duration?: number
+   638→  format?: (n: number) => string
+   639→  className?: string
+   640→}) {
+   641→  const mv = useMotionValue(0)
+   642→  // Spring-smoothed motion value — the spring's damping/stiffness produce
+   643→  // the satisfying "settle" feel rather than a linear tween.
+   644→  const spring = useSpring(mv, { stiffness: 90, damping: 18, mass: 0.6 })
+   645→  const [display, setDisplay] = React.useState('0')
+   646→  const prefersReducedMotion = usePrefersReducedMotion()
+   647→
+   648→  // Animate the motion value from 0 → value whenever `value` changes.
+   649→  React.useEffect(() => {
+   650→    if (prefersReducedMotion) {
+   651→      setDisplay(format(value))
+   652→      return
+   653→    }
+   654→    const controls = animate(mv, value, {
+   655→      duration,
+   656→      ease: [0.16, 1, 0.3, 1],
+   657→    })
+   658→    return () => controls.stop()
+   659→  }, [value, duration, mv, prefersReducedMotion, format])
+   660→
+   661→  // Subscribe to spring changes → format + setState. Wrapped in rAF-throttled
+   662→  // requestAnimationFrame so we don't re-render React 60x/sec.
+   663→  React.useEffect(() => {
+   664→    let rafId = 0
+   665→    const update = (v: number) => {
+   666→      if (rafId) return
+   667→      rafId = requestAnimationFrame(() => {
+   668→        rafId = 0
+   669→        setDisplay(format(v))
+   670→      })
+   671→    }
+   672→    const unsub = spring.on('change', update)
+   673→    return () => {
+   674→      if (rafId) cancelAnimationFrame(rafId)
+   675→      unsub()
+   676→    }
+   677→  }, [spring, format])
+   678→
+   679→  return <span className={className}>{display}</span>
+   680→}
+   681→
+   682→/**
+   683→ * Framer Motion variants for the staggered entrance of result cards. The
+   684→ * container orchestrates children with a 50ms stagger; each child springs
+   685→ * in from y:12 with a slight scale-up.
+   686→ */
+   687→const RESULTS_CONTAINER_VARIANTS: Variants = {
+   688→  hidden: { opacity: 0 },
+   689→  show: {
+   690→    opacity: 1,
+   691→    transition: {
+   692→      staggerChildren: 0.05,
+   693→      delayChildren: 0.02,
+   694→      // Cap the stagger so a 10-result page finishes around 0.45s — long
+   695→      // result lists don't drag the entrance out forever.
+   696→      staggerDirection: 1,
+   697→    },
+   698→  },
+   699→}
+   700→
+   701→const RESULT_ITEM_VARIANTS: Variants = {
+   702→  hidden: { opacity: 0, y: 12, scale: 0.98 },
+   703→  show: {
+   704→    opacity: 1,
+   705→    y: 0,
+   706→    scale: 1,
+   707→    transition: {
+   708→      type: 'spring',
+   709→      stiffness: 220,
+   710→      damping: 22,
+   711→      mass: 0.9,
+   712→    },
+   713→  },
+   714→}
+   715→
+   716→/**
+   717→ * Hook: returns true if the user prefers reduced motion. Same as
+   718→ * framer-motion's `useReducedMotion` but normalizes to a boolean (the
+   719→ * framer-motion hook returns `null` before mount which is awkward for
+   720→ * effect deps).
+   721→ */
+   722→function usePrefersReducedMotion(): boolean {
+   723→  const v = useFramerReducedMotion()
+   724→  return v ?? false
+   725→}
+   726→
+   727→export default SearchResults
+   728→
