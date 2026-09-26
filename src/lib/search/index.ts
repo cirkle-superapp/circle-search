@@ -761,7 +761,7 @@ export async function search(
 
   // Build the kept set (for the page slice)
   const keptIds = new Set(divResult.kept)
-  const finalRanked = ranked.filter((r) => keptIds.has(r.docId))
+  let finalRanked = ranked.filter((r) => keptIds.has(r.docId))
 
   // Pagination
   const pageSize = Math.max(1, Math.min(50, filters.pageSize || 10))
@@ -778,7 +778,7 @@ export async function search(
   const contentMap = await fetchContentForSnippets(topDocIds)
 
   // Build result objects
-  const results: SearchResult[] = pageRanked.map((r) => {
+  let results: SearchResult[] = pageRanked.map((r) => {
     const doc = dbDocsForRank.get(r.docId) as DocRow
     const clusterSize = (divResult.clusters.find((c) => c.primaryId === r.docId)?.size) ?? 1
     return {
