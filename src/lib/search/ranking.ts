@@ -314,20 +314,12 @@ export async function rankCandidates(
   // candidates come from BM25 retrieval), set it to 1 to avoid division by 0.
   const maxLex = Math.max(...candidates.map((c) => c.tfidf), 0.0001)
   const minLex = Math.min(...candidates.map((c) => c.tfidf), 0)
-
-  // Drop near-miss candidates: if the best score is meaningfully higher
-  // than a candidate's score (normalized < 0.05), that candidate is likely
-  // an accidental match (e.g. "Steve Jobs" matching "Rust book" because
-  // "jobs" appears in job postings on the page). This is the most impactful
-  // fix for the relevance crisis.
+  const queryTermSet = new Set(parsed.tokens.map((t) => t.toLowerCase()))
   const RELEVANCE_THRESHOLD = 0.05
+  const MIN_COVERAGE = 0.25
 
   const results: RankedResult[] = []
 
-  // --- Automatic freshness detection ---
-  // If the query contains freshness keywords (today, latest, breaking,
-  // current, recent, this week/month), boost the freshness weight in ranking
-  // — even if the user didn't explicitly select a freshness filter or LATEST mode.
   const freshnessKeywords = ['today', 'latest', 'breaking', 'current', 'recent', 'this week', 'this month', 'now', 'new', 'update', 'live']
   const queryLower = parsed.original.toLowerCase()
   const hasFreshnessIntent = freshnessKeywords.some(kw => queryLower.includes(kw)) || parsed.intent === 'news'
@@ -336,12 +328,14 @@ export async function rankCandidates(
     const doc = dbDocs.get(c.docId)
     if (!doc) continue
 
-    // P0-3: normalize lexical + semantic signals to [0,1].
-    // We use max-normalization (divide by the maximum) so the top candidate
-    // always gets lex=1.0, and other candidates get a fraction.
     const lex = (c.tfidf - minLex) / (maxLex - minLex + 0.0001)
-    // Out-of-box: use the precomputed embedding cosine similarity directly
-    // (already in [0,1] — set to 0 when embeddings module unavailable).
+    const matchedTermSet = new Set(c.matchedTerms.map((t) => t.toLowerCase()))
+    let coveredCount = 0
+    for (const qt of queryTermSet) {
+      if (matchedTermSet.has(qt)) coveredCount++
+    }
+    const coverage = queryTermSet.size > 0 ? coveredCount / queryTermSet.size : 0
+
     const sem = c.semanticBoost ?? semanticBoost(lex, c.matchedTerms)
     const q = doc.qualityScore
     const fr = freshnessScore(doc)
@@ -364,9 +358,10 @@ export async function rankCandidates(
     // often DON'T share tokens with the user's framing).
     const lens = ctx?.lens ?? 'BALANCED'
     const isDevilsAdvocate = lens === 'DEVILS_ADVOCATE'
-    if (!isDevilsAdvocate && lex < RELEVANCE_THRESHOLD && sem < 0.4 && mode !== 'IMAGES') {
-      // For IMAGE mode, keep all candidates (image results are based on
-      // og:image presence, not token relevance).
+    if (!isDevilsAdvocate && coverage < MIN_COVERAGE && mode !== 'IMAGES') {
+      continue
+    }
+    if (!isDevilsAdvocate && coverage < 0.5 && lex < RELEVANCE_THRESHOLD && sem < 0.4 && mode !== 'IMAGES') {
       continue
     }
 
@@ -409,15 +404,32 @@ export async function rankCandidates(
       lexWeight = 0.20; qWeight = 0.20; frWeight = 0.10
     }
 
+    // Title match boost
+    const titleLower = (doc.title || '').toLowerCase()
+    const queryLowerStr = parsed.original.toLowerCase().trim()
+    let titleBoost = 0
+    if (titleLower.includes(queryLowerStr) && queryLowerStr.length > 3) {
+      titleBoost = 0.20
+    } else {
+      const titleTokens = new Set(titleLower.split(/\s+/))
+      let titleTokenMatches = 0
+      for (const qt of queryTermSet) {
+        if (titleTokens.has(qt)) titleTokenMatches++
+      }
+      if (queryTermSet.size > 0 && titleTokenMatches === queryTermSet.size) {
+        titleBoost = 0.15
+      } else if (titleTokenMatches > 0 && titleTokenMatches >= queryTermSet.size / 2) {
+        titleBoost = 0.08
+      }
+    }
+
     let score = 0
     switch (mode) {
       case 'BALANCED':
-        // When the query has freshness intent (today/latest/breaking/news),
-        // boost the freshness weight from 0.10 → 0.25 and reduce lexical.
         if (hasFreshnessIntent) {
-          score = 0.22 * lexForScoring + 0.13 * sem + 0.15 * q + 0.25 * fr + 0.08 * st + 0.05 * or + 0.05 * intent + 0.07 * auth
+          score = 0.15 * coverage + 0.15 * lexForScoring + 0.08 * sem + 0.12 * q + 0.25 * fr + 0.06 * st + 0.05 * or + 0.05 * intent + 0.07 * auth + titleBoost
         } else {
-          score = lexWeight * lexForScoring + semWeight * sem + qWeight * q + frWeight * fr + stWeight * st + orWeight * or + intentWeight * intent + authWeight * auth
+          score = 0.30 * coverage + 0.12 * lexForScoring + 0.08 * sem + 0.08 * q + 0.05 * fr + 0.05 * st + 0.05 * or + 0.05 * intent + 0.07 * auth + titleBoost
         }
         break
       case 'EXACT':
