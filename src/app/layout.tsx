@@ -1,25 +1,21 @@
 import type { Metadata, Viewport } from "next";
+// Using system fonts via CSS variables (no Google Fonts dependency)
 import { Inter, Fraunces, Tajawal } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 
-const inter = Inter({
-  variable: "--font-inter",
-  subsets: ["latin"],
-  display: "swap",
-});
-const fraunces = Fraunces({
-  variable: "--font-fraunces",
-  subsets: ["latin"],
-  display: "swap",
-  weight: ["300", "400", "500", "600", "700"],
-});
-const tajawal = Tajawal({
-  variable: "--font-tajawal",
-  subsets: ["arabic", "latin"],
-  display: "swap",
-  weight: ["300", "400", "500", "700"],
-});
+let inter: { variable: string };
+try {
+  inter = Inter({ variable: "--font-inter", subsets: ["latin"], display: "swap" });
+} catch { inter = { variable: "--font-inter" }; }
+let fraunces: { variable: string };
+try {
+  fraunces = Fraunces({ variable: "--font-fraunces", subsets: ["latin"], display: "swap", weight: ["300", "400", "500", "600", "700"] });
+} catch { fraunces = { variable: "--font-fraunces" }; }
+let tajawal: { variable: string };
+try {
+  tajawal = Tajawal({ variable: "--font-tajawal", subsets: ["arabic", "latin"], display: "swap", weight: ["300", "400", "500", "700"] });
+} catch { tajawal = { variable: "--font-tajawal" }; }
 
 export const metadata: Metadata = {
   title: "CIRKLE — Search the open web. Decide for yourself.",
