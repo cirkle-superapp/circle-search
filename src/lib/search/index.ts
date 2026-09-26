@@ -975,6 +975,56 @@ export async function search(
     }
   }
 
+  // MERGE live-web results into the main results array when:
+  // 1. Index results are weak (fewer than 3, or top score < 0.35)
+  // 2. Live-web results exist
+  // The live-web results are prepended (shown FIRST) because they're from
+  // the real web (DuckDuckGo) + are more relevant than the small local
+  // index for broad topical queries. This fixes the "wrong outputs" issue
+  // where users saw irrelevant index results above the correct live-web ones.
+  if (liveWebResults.length > 0) {
+    const weakIndex = finalRanked.length < 3 || (topMeanScore > 0 && topMeanScore < 0.35)
+    if (weakIndex || finalRanked.length === 0) {
+      // Convert live-web results to SearchResult format + prepend to results
+      const liveAsSearchResults: SearchResult[] = liveWebResults.slice(0, 10).map((r, i) => ({
+        id: `liveweb-${i}`,
+        title: r.title,
+        url: r.url,
+        domain: r.domain,
+        snippet: r.snippet,
+        sourceType: r.sourceType,
+        publishedAt: null,
+        updatedAt: null,
+        language: 'en',
+        country: null,
+        isOriginal: true,
+        clusterId: null,
+        clusterSize: 1,
+        whyThisResult: ['Live web result', 'From DuckDuckGo/BrightData search'],
+        relevanceScore: 0.8 - (i * 0.05), // decreasing score for ordering
+        qualityScore: 0.5,
+        author: null,
+        docType: 'web',
+        ogImage: null,
+      }))
+      // Prepend live-web results (they appear FIRST)
+      results = [...liveAsSearchResults, ...results]
+      // Update finalRanked for pagination
+      finalRanked = [
+        ...liveAsSearchResults.map((r, i) => ({
+          docId: r.id,
+          relevanceScore: r.relevanceScore,
+          whySignals: r.whyThisResult,
+        })),
+        ...finalRanked,
+      ]
+    }
+    // Clear liveWebResults if merged (they're now in the main results)
+    if (weakIndex || finalRanked.length === 0) {
+      liveWebResults = []
+    }
+  }
+
   // SearchHistory (only if personalization ON and a sessionId exists)
   const personalized = opts.personalization === 'ON' && !!opts.sessionId
   if (personalized && opts.sessionId) {

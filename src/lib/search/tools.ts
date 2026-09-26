@@ -918,35 +918,13 @@ export function shouldLiveWebFallback(
   topResultsMatchedTerms?: string[],
 ): boolean {
   const parsed = parseQuery(query)
-  if (parsed.tokens.length < 2) return false
-  // Don't fallback for pure navigational queries (single brand name) — those
-  // are better served by the index (and likely have an exact match).
-  if (parsed.intent === 'navigational' && parsed.tokens.length <= 2) return false
+  if (parsed.tokens.length < 1) return false
+  // Don't fallback for pure navigational queries (single brand name).
+  if (parsed.intent === 'navigational' && parsed.tokens.length <= 1) return false
 
-  // P1-1: trigger if any of the weak-confidence conditions.
-  // Score threshold of 0.4 is calibrated so that weak matches (mean
-  // relevanceScore below 0.4 across top-3) trigger the live-web fallback.
-  // For "Steve Jobs" → top-3 mean score = 0.30 → triggers fallback.
-  // For "react" → top-3 mean score = 0.7+ → doesn't trigger.
-  if (indexResultCount === 0) return true
-  if (indexResultCount < 3) return true
-  if (typeof topResultsMeanScore === 'number' && topResultsMeanScore < 0.4) return true
-
-  // P1-1 (extended): query coverage check. The top-3 results collectively
-  // should cover ≥50% of the query's tokens (stemmed on both sides for
-  // matching — e.g. user query "jobs" stems to "job"; the index stores "job"
-  // so matchedTerms contain "job"; both sides must be stemmed for the
-  // comparison to work).
-  if (Array.isArray(topResultsMatchedTerms) && parsed.tokens.length > 0) {
-    const matchedSet = new Set(topResultsMatchedTerms.map((t) => stem(t.toLowerCase())))
-    const queryTermSet = new Set(parsed.tokens.map((t) => stem(t.toLowerCase())))
-    let coveredCount = 0
-    for (const t of queryTermSet) {
-      if (matchedSet.has(t)) coveredCount++
-    }
-    const coverage = coveredCount / queryTermSet.size
-    if (coverage < 0.5) return true
-  }
-
-  return false
+  // ALWAYS trigger the live-web fallback — fetch DuckDuckGo results for
+  // every query. The caller merges the live-web results into the main
+  // results array when index results are weak. This ensures the user
+  // ALWAYS sees real web results, not just the small 65-doc local index.
+  return true
 }
