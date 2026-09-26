@@ -1,51 +1,40 @@
 import type { Metadata, Viewport } from "next";
-// Using system fonts via CSS variables (no Google Fonts dependency)
-import { Inter, Fraunces, Tajawal } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
-
-let inter: { variable: string };
-try {
-  inter = Inter({ variable: "--font-inter", subsets: ["latin"], display: "swap" });
-} catch { inter = { variable: "--font-inter" }; }
-let fraunces: { variable: string };
-try {
-  fraunces = Fraunces({ variable: "--font-fraunces", subsets: ["latin"], display: "swap", weight: ["300", "400", "500", "600", "700"] });
-} catch { fraunces = { variable: "--font-fraunces" }; }
-let tajawal: { variable: string };
-try {
-  tajawal = Tajawal({ variable: "--font-tajawal", subsets: ["arabic", "latin"], display: "swap", weight: ["300", "400", "500", "700"] });
-} catch { tajawal = { variable: "--font-tajawal" }; }
+import { JsonLd, homePageJsonLd } from "@/components/search/JsonLd";
 
 export const metadata: Metadata = {
-  title: "CIRKLE — Search the open web. Decide for yourself.",
+  title: "Cirkle Search Engine — Search the open web. Decide for yourself.",
   description:
-    "CIRKLE is an independent, privacy-first web search engine with its own crawler, index, ranking, source transparency, evidence-grounded AI, and user-controlled search modes.",
+    "Cirkle Search Engine (دواير) — an independent, privacy-first web search engine with its own crawler, index, ranking, source transparency, evidence-grounded AI, and user-controlled search modes.",
   keywords: [
-    "CIRKLE",
+    "Cirkle Search Engine",
     "search engine",
     "privacy search",
     "independent search",
     "evidence-grounded AI",
     "deep research",
     "source transparency",
-    "دواير",
+    "Cirkle",
   ],
-  authors: [{ name: "CIRKLE" }],
+  authors: [{ name: "Cirkle" }],
   manifest: "/manifest.json",
   icons: {
-    icon: "/cirkle-favicon.svg",
-    apple: "/cirkle-logo.svg",
+    icon: [
+      { url: "/favicon.ico", sizes: "any", type: "image/x-icon" },
+      { url: "/cirkle-favicon.ico", sizes: "256x256", type: "image/x-icon" },
+    ],
+    apple: "/cirkle-favicon.ico",
   },
   openGraph: {
-    title: "CIRKLE",
+    title: "Cirkle Search Engine",
     description: "Search the open web. Decide for yourself.",
-    siteName: "CIRKLE",
+    siteName: "Cirkle Search Engine",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "CIRKLE",
+    title: "Cirkle Search Engine",
     description: "Search the open web. Decide for yourself.",
   },
 };
@@ -69,10 +58,11 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body
-        className={`${inter.variable} ${fraunces.variable} ${tajawal.variable} antialiased bg-background text-foreground`}
+        className="antialiased bg-background text-foreground"
+        style={{
+          fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+        }}
       >
-        {/* Prevent FOUC: apply saved theme before hydration.
-            Respects prefers-color-scheme for first-time visitors. */}
         <script
           dangerouslySetInnerHTML={{
             __html: `(function(){try{var t=localStorage.getItem("cirkle-theme");if(t===null){t=window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";}if(t==="dark"){document.documentElement.classList.add("dark");}}catch(e){}})();`,
@@ -80,6 +70,7 @@ export default function RootLayout({
         />
         {children}
         <Toaster />
+        <JsonLd data={homePageJsonLd()} />
       </body>
     </html>
   );
