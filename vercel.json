@@ -1,45 +1,20 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
-  "installCommand": "npm install",
-  "buildCommand": "npx prisma generate && next build",
-  "regions": [
-    "iad1"
-  ],
+  "buildCommand": "next build",
+  "regions": ["iad1"],
   "functions": {
-    "src/app/api/search/route.ts": {
-      "maxDuration": 30
-    },
-    "src/app/api/search/ai/route.ts": {
-      "maxDuration": 60
-    },
-    "src/app/api/search/stream/route.ts": {
-      "maxDuration": 60
-    },
-    "src/app/api/seed/route.ts": {
-      "maxDuration": 300
-    },
-    "src/app/api/research/route.ts": {
-      "maxDuration": 300
-    },
-    "src/app/api/reindex/route.ts": {
-      "maxDuration": 120
-    },
-    "src/app/api/inngest/route.ts": {
-      "maxDuration": 60
-    },
-    "src/app/api/page-summary/route.ts": {
-      "maxDuration": 30
-    },
-    "src/app/api/brightdata/scrape/route.ts": {
-      "maxDuration": 60
-    },
-    "src/app/api/brightdata/snapshot/[id]/route.ts": {
-      "maxDuration": 60
-    },
-    "src/app/api/brightdata/datasets/route.ts": {
-      "maxDuration": 60
-    }
+    "src/app/api/search/route.ts": { "maxDuration": 30 },
+    "src/app/api/search/ai/route.ts": { "maxDuration": 60 },
+    "src/app/api/search/stream/route.ts": { "maxDuration": 60 },
+    "src/app/api/seed/route.ts": { "maxDuration": 300 },
+    "src/app/api/research/route.ts": { "maxDuration": 300 },
+    "src/app/api/reindex/route.ts": { "maxDuration": 120 },
+    "src/app/api/inngest/route.ts": { "maxDuration": 60 },
+    "src/app/api/page-summary/route.ts": { "maxDuration": 30 },
+    "src/app/api/brightdata/scrape/route.ts": { "maxDuration": 60 },
+    "src/app/api/brightdata/snapshot/[id]/route.ts": { "maxDuration": 60 },
+    "src/app/api/brightdata/datasets/route.ts": { "maxDuration": 60 }
   },
   "env": {
     "NEXT_PUBLIC_APP_NAME": "Cirkle Search Engine",
